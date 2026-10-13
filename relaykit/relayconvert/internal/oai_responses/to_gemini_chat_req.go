@@ -85,18 +85,29 @@ func OpenAIResponsesRequestToGeminiChat(c context.Context, req *dto.OpenAIRespon
 	if err != nil {
 		return nil, err
 	}
+	functionDeclarations := make([]map[string]any, 0, len(functions))
+	jsonSchema := opts.Gemini.SupportsJSONSchemaModel(upstreamModelName)
 	for i := range functions {
-		if params, ok := functions[i].Parameters.(map[string]any); ok {
-			if props, hasProps := params["properties"].(map[string]any); hasProps && len(props) == 0 {
-				functions[i].Parameters = nil
-				continue
-			}
+		declaration, misfits := sharedgemini.FunctionDeclaration(
+			functions[i].Name,
+			functions[i].Description,
+			functions[i].Parameters,
+			jsonSchema,
+		)
+		for _, misfit := range misfits {
+			convdiag.Add(c, types.ConversionDiagnostic{
+				Code:     "gemini_schema_keyword_dropped",
+				Path:     fmt.Sprintf("tools[%d].parameters", i),
+				Message:  fmt.Sprintf("Gemini function parameters cannot carry %s", misfit),
+				Severity: types.ConversionDiagnosticWarning,
+				To:       types.RelayFormatGemini,
+			})
 		}
-		functions[i].Parameters = sharedgemini.CleanFunctionParameters(functions[i].Parameters)
+		functionDeclarations = append(functionDeclarations, declaration)
 	}
-	if len(functions) > 0 {
+	if len(functionDeclarations) > 0 {
 		geminiRequest.SetTools([]dto.GeminiChatTool{
-			{FunctionDeclarations: functions},
+			{FunctionDeclarations: functionDeclarations},
 		})
 	}
 

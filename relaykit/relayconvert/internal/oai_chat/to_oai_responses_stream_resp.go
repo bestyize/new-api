@@ -182,6 +182,8 @@ func (s *ChatToResponsesStreamState) StartHostedTool(start HostedToolStreamStart
 		tool.Output.Name = start.Name
 		tool.Output.ServerLabel = start.ServerLabel
 		tool.Output.Arguments = arguments
+	case dto.ResponsesOutputTypeImageGenerationCall:
+		// The image result is attached when the provider stream completes.
 	}
 	outputIndex := s.nextHostedIndex(start.ID)
 	tool.OutputIndex = outputIndex
@@ -192,13 +194,17 @@ func (s *ChatToResponsesStreamState) StartHostedTool(start HostedToolStreamStart
 	if start.Type == "mcp_call" {
 		addedItem.Arguments = json.RawMessage(`""`)
 	}
+	toolEvent := hostedEventPrefix(start.Type) + ".in_progress"
+	if start.Type == dto.ResponsesOutputTypeImageGenerationCall {
+		toolEvent = hostedEventPrefix(start.Type) + ".generating"
+	}
 	events = append(events,
 		s.event(responsesEventOutputItemAdded, dto.ResponsesStreamResponse{
 			OutputIndex: intPtr(outputIndex),
 			ItemID:      start.ID,
 			Item:        addedItem,
 		}),
-		s.event(hostedEventPrefix(start.Type)+".in_progress", dto.ResponsesStreamResponse{
+		s.event(toolEvent, dto.ResponsesStreamResponse{
 			OutputIndex: intPtr(outputIndex),
 			ItemID:      start.ID,
 		}),
@@ -258,6 +264,8 @@ func (s *ChatToResponsesStreamState) CompleteHostedTool(result HostedToolStreamR
 			return nil, fmt.Errorf("encode Responses MCP output: %w", err)
 		}
 		tool.Output.Output = output
+	case dto.ResponsesOutputTypeImageGenerationCall:
+		tool.Output.Result = string(result.Result)
 	}
 	if failed {
 		tool.Output.Status = "failed"
@@ -289,6 +297,36 @@ func (s *ChatToResponsesStreamState) CompleteHostedTool(result HostedToolStreamR
 		Item:        cloneHostedOutput(&tool.Output),
 	}))
 	return events, nil
+}
+
+// FlushOutputItems closes any open message, reasoning, or function-call items
+// before provider-hosted output items are appended at the end of a stream.
+func (s *ChatToResponsesStreamState) FlushOutputItems() []ChatToResponsesStreamEvent {
+	if s == nil || s.finalized {
+		return nil
+	}
+	return s.doneDeltaEvents()
+}
+
+// AddImagePartial emits one Responses partial-image event for an image
+// generation item that has already been announced with StartHostedTool.
+func (s *ChatToResponsesStreamState) AddImagePartial(id string, index int, imageBase64 string) ([]ChatToResponsesStreamEvent, error) {
+	if s == nil {
+		return nil, fmt.Errorf("Chat-to-Responses stream state is required")
+	}
+	id = strings.TrimSpace(id)
+	tool := s.hostedByID[id]
+	if tool == nil || tool.Output.Type != dto.ResponsesOutputTypeImageGenerationCall {
+		return nil, fmt.Errorf("partial image references unknown image-generation call %q", id)
+	}
+	if tool.Done {
+		return nil, fmt.Errorf("partial image references completed image-generation call %q", id)
+	}
+	return []ChatToResponsesStreamEvent{s.event(hostedEventPrefix(tool.Output.Type)+".partial_image", dto.ResponsesStreamResponse{
+		OutputIndex:       intPtr(tool.OutputIndex),
+		PartialImageIndex: intPtr(index),
+		PartialImageB64:   imageBase64,
+	})}, nil
 }
 
 // Fail emits a terminal Responses error using the same event allocator as the
@@ -931,6 +969,8 @@ func hostedEventPrefix(outputType string) string {
 		return "response.web_search_call"
 	case "mcp_call":
 		return "response.mcp_call"
+	case dto.ResponsesOutputTypeImageGenerationCall:
+		return "response.image_generation_call"
 	default:
 		return ""
 	}

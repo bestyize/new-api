@@ -10,10 +10,12 @@ import (
 
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/relayconvert/convmeta"
+	"github.com/QuantumNous/new-api/relaykit/relayconvert/internal/convdiag"
 	relaymedia "github.com/QuantumNous/new-api/relaykit/relayconvert/internal/media"
 	sharedgemini "github.com/QuantumNous/new-api/relaykit/relayconvert/internal/shared/gemini"
 	kitutil "github.com/QuantumNous/new-api/relaykit/relayconvert/kitutil"
 	"github.com/QuantumNous/new-api/relaykit/relayconvert/reasoning"
+	"github.com/QuantumNous/new-api/relaykit/types"
 )
 
 func OpenAIChatRequestToGeminiGenerateContent(c context.Context, textRequest dto.GeneralOpenAIRequest, info convmeta.Meta) (*dto.GeminiChatRequest, error) {
@@ -157,17 +159,25 @@ func OpenAIChatRequestToGeminiGenerateContent(c context.Context, textRequest dto
 	}
 
 	if textRequest.Tools != nil {
-		functions := make([]dto.FunctionRequest, 0, len(textRequest.Tools))
-		for _, tool := range textRequest.Tools {
-			if tool.Function.Parameters != nil {
-				if params, ok := tool.Function.Parameters.(map[string]any); ok {
-					if props, hasProps := params["properties"].(map[string]any); hasProps && len(props) == 0 {
-						tool.Function.Parameters = nil
-					}
-				}
+		functions := make([]map[string]any, 0, len(textRequest.Tools))
+		jsonSchema := opts.Gemini.SupportsJSONSchemaModel(upstreamModelName)
+		for index, tool := range textRequest.Tools {
+			function, misfits := sharedgemini.FunctionDeclaration(
+				tool.Function.Name,
+				tool.Function.Description,
+				tool.Function.Parameters,
+				jsonSchema,
+			)
+			for _, misfit := range misfits {
+				convdiag.Add(c, types.ConversionDiagnostic{
+					Code:     "gemini_schema_keyword_dropped",
+					Path:     fmt.Sprintf("tools[%d].function.parameters", index),
+					Message:  fmt.Sprintf("Gemini function parameters cannot carry %s", misfit),
+					Severity: types.ConversionDiagnosticWarning,
+					To:       types.RelayFormatGemini,
+				})
 			}
-			tool.Function.Parameters = sharedgemini.CleanFunctionParameters(tool.Function.Parameters)
-			functions = append(functions, tool.Function)
+			functions = append(functions, function)
 		}
 		geminiTools := geminiRequest.GetTools()
 		if len(functions) > 0 {

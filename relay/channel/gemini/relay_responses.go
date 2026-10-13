@@ -207,7 +207,7 @@ func GeminiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, r
 
 	usage, streamAPIError := geminiStreamHandler(c, info, resp, func(_ string, geminiResponse *dto.GeminiChatResponse) bool {
 		hostedBridge.Observe(geminiResponse)
-		return sendChunk(geminiResponse)
+		return sendChunk(geminiResponseWithoutGeneratedImages(geminiResponse))
 	})
 	if streamAPIError != nil {
 		if failResponsesStream(streamAPIError) && streamErr == nil {
@@ -260,4 +260,24 @@ func GeminiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, r
 		}
 	}
 	return usage, nil
+}
+
+func geminiResponseWithoutGeneratedImages(response *dto.GeminiChatResponse) *dto.GeminiChatResponse {
+	if response == nil {
+		return nil
+	}
+	filtered := *response
+	filtered.Candidates = append([]dto.GeminiChatCandidate(nil), response.Candidates...)
+	for candidateIndex := range filtered.Candidates {
+		content := filtered.Candidates[candidateIndex].Content
+		content.Parts = make([]dto.GeminiPart, 0, len(content.Parts))
+		for _, part := range filtered.Candidates[candidateIndex].Content.Parts {
+			if part.InlineData != nil && strings.HasPrefix(strings.ToLower(part.InlineData.MimeType), "image/") {
+				continue
+			}
+			content.Parts = append(content.Parts, part)
+		}
+		filtered.Candidates[candidateIndex].Content = content
+	}
+	return &filtered
 }

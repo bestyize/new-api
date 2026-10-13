@@ -2,6 +2,7 @@ package claudemessages
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 
@@ -33,6 +34,8 @@ func ClaudeMessagesRequestToOpenAIChat(ctx context.Context, claudeRequest dto.Cl
 	}
 	if claudeRequest.MaxTokens != nil {
 		openAIRequest.MaxTokens = kitutil.GetPointer(*claudeRequest.MaxTokens)
+	} else if claudeRequest.MaxTokensToSample != nil {
+		openAIRequest.MaxTokens = kitutil.GetPointer(*claudeRequest.MaxTokensToSample)
 	}
 	if claudeRequest.TopP != nil {
 		openAIRequest.TopP = kitutil.GetPointer(*claudeRequest.TopP)
@@ -115,6 +118,33 @@ func ClaudeMessagesRequestToOpenAIChat(ctx context.Context, claudeRequest dto.Cl
 		openAITools = append(openAITools, openAITool)
 	}
 	openAIRequest.Tools = openAITools
+	outputFormat, err := claudeStructuredOutputFormat(claudeRequest.OutputConfig, claudeRequest.OutputFormat)
+	if err != nil {
+		return nil, err
+	}
+	if len(outputFormat) > 0 {
+		chatSchema, err := claudeStructuredOutputChatSchema(outputFormat)
+		if err != nil {
+			return nil, err
+		}
+		openAIRequest.ResponseFormat = &dto.ResponseFormat{
+			Type:       "json_schema",
+			JsonSchema: chatSchema,
+		}
+	}
+	toolChoice, disableParallelToolUse, err := claudeToolChoiceToChat(claudeRequest.ToolChoice)
+	if err != nil {
+		return nil, err
+	}
+	openAIRequest.ToolChoice = toolChoice
+	if disableParallelToolUse {
+		convdiag.Add(ctx, types.ConversionDiagnostic{
+			Code:     "unsupported_parallel_tool_limit",
+			Path:     "tool_choice.disable_parallel_tool_use",
+			Message:  "Gemini function calling has no setting to prohibit multiple function calls in one turn",
+			Severity: types.ConversionDiagnosticWarning,
+		})
+	}
 
 	openAIMessages := make([]dto.Message, 0)
 	if claudeRequest.System != nil {
@@ -192,16 +222,15 @@ func ClaudeMessagesRequestToOpenAIChat(ctx context.Context, claudeRequest dto.Cl
 					url := claudeImageSourceURL(mediaMsg.Source)
 					if url == "" {
 						sourceType := ""
+						fileID := ""
 						if mediaMsg.Source != nil {
 							sourceType = mediaMsg.Source.Type
+							fileID = mediaMsg.Source.FileID
 						}
-						convdiag.Add(ctx, types.ConversionDiagnostic{
-							Code:     "unsupported_media_source",
-							Path:     fmt.Sprintf("messages[%d].content[%d].source", messageIndex, blockIndex),
-							Message:  fmt.Sprintf("OpenAI Chat Completions cannot reference a Claude image with source type %q; the image was omitted", sourceType),
-							Severity: types.ConversionDiagnosticError,
-						})
-						continue
+						if sourceType == "file" {
+							return nil, fmt.Errorf("Claude file-backed image %q cannot be resolved for Gemini; send the image as base64 or a URL", fileID)
+						}
+						return nil, fmt.Errorf("Claude image at messages[%d].content[%d] has unsupported source type %q or no image data", messageIndex, blockIndex, sourceType)
 					}
 					mediaMessages = append(mediaMessages, dto.MediaContent{
 						Type:     "image_url",
@@ -215,16 +244,15 @@ func ClaudeMessagesRequestToOpenAIChat(ctx context.Context, claudeRequest dto.Cl
 					}
 					if mediaMsg.Source == nil || mediaMsg.Source.Type != "base64" || mediaMsg.Source.MediaType != "application/pdf" {
 						sourceType, mediaType := "", ""
+						fileID := ""
 						if mediaMsg.Source != nil {
 							sourceType, mediaType = mediaMsg.Source.Type, mediaMsg.Source.MediaType
+							fileID = mediaMsg.Source.FileID
 						}
-						convdiag.Add(ctx, types.ConversionDiagnostic{
-							Code:     "unsupported_media_source",
-							Path:     fmt.Sprintf("messages[%d].content[%d].source", messageIndex, blockIndex),
-							Message:  fmt.Sprintf("OpenAI Chat Completions carries only base64 PDF and plain-text documents, not a %q source of type %q; the document was omitted", sourceType, mediaType),
-							Severity: types.ConversionDiagnosticError,
-						})
-						continue
+						if sourceType == "file" {
+							return nil, fmt.Errorf("Claude file-backed document %q cannot be resolved for Gemini; send document content as base64 or text", fileID)
+						}
+						return nil, fmt.Errorf("Claude document at messages[%d].content[%d] has unsupported source type %q and media type %q", messageIndex, blockIndex, sourceType, mediaType)
 					}
 					mediaMessages = append(mediaMessages, dto.MediaContent{
 						Type: dto.ContentTypeFile,
@@ -256,7 +284,10 @@ func ClaudeMessagesRequestToOpenAIChat(ctx context.Context, claudeRequest dto.Cl
 					if mediaMsg.IsStringContent() {
 						oaiToolMessage.SetStringContent(mediaMsg.GetStringContent())
 					} else {
-						content, media := claudeToolResultToChat(mediaMsg.ParseMediaContent())
+						content, media, err := claudeToolResultToChat(mediaMsg.ParseMediaContent())
+						if err != nil {
+							return nil, err
+						}
 						oaiToolMessage.SetStringContent(content)
 						// A Chat tool message only carries text. Images from the tool result
 						// join the user message this Claude message becomes, which lands right
@@ -264,6 +295,24 @@ func ClaudeMessagesRequestToOpenAIChat(ctx context.Context, claudeRequest dto.Cl
 						mediaMessages = append(mediaMessages, media...)
 					}
 					openAIMessages = append(openAIMessages, oaiToolMessage)
+				case "thinking":
+					convdiag.Add(ctx, types.ConversionDiagnostic{
+						Code:     "unsupported_thinking_history",
+						Path:     fmt.Sprintf("messages[%d].content[%d]", messageIndex, blockIndex),
+						Message:  "Claude thinking history is provider-specific and was omitted from Gemini request history",
+						Severity: types.ConversionDiagnosticWarning,
+						To:       types.RelayFormatGemini,
+					})
+				case "redacted_thinking":
+					convdiag.Add(ctx, types.ConversionDiagnostic{
+						Code:     "unsupported_redacted_thinking",
+						Path:     fmt.Sprintf("messages[%d].content[%d]", messageIndex, blockIndex),
+						Message:  "Claude redacted thinking cannot be represented in Gemini request history",
+						Severity: types.ConversionDiagnosticWarning,
+						To:       types.RelayFormatGemini,
+					})
+				default:
+					return nil, fmt.Errorf("unsupported Claude message block type %q at messages[%d].content[%d]", mediaMsg.Type, messageIndex, blockIndex)
 				}
 			}
 
@@ -286,12 +335,98 @@ func ClaudeMessagesRequestToOpenAIChat(ctx context.Context, claudeRequest dto.Cl
 	return &openAIRequest, nil
 }
 
+func claudeToolChoiceToChat(value any) (any, bool, error) {
+	if value == nil {
+		return nil, false, nil
+	}
+	choice, err := kitutil.Any2Type[dto.ClaudeToolChoice](value)
+	if err != nil {
+		return nil, false, fmt.Errorf("invalid Claude tool_choice: %w", err)
+	}
+	switch choice.Type {
+	case "", "auto":
+		return "auto", choice.DisableParallelToolUse, nil
+	case "any":
+		return "required", choice.DisableParallelToolUse, nil
+	case "none":
+		return "none", false, nil
+	case "tool":
+		if strings.TrimSpace(choice.Name) == "" {
+			return nil, false, fmt.Errorf("Claude tool_choice.type=tool requires a tool name")
+		}
+		return map[string]any{
+			"type":     "function",
+			"function": map[string]any{"name": choice.Name},
+		}, choice.DisableParallelToolUse, nil
+	default:
+		return nil, false, fmt.Errorf("unsupported Claude tool_choice type %q", choice.Type)
+	}
+}
+
+func claudeStructuredOutputFormat(outputConfig, legacyFormat json.RawMessage) (json.RawMessage, error) {
+	var format json.RawMessage
+	if len(outputConfig) > 0 {
+		var config struct {
+			Format json.RawMessage `json:"format"`
+		}
+		if err := kitutil.Unmarshal(outputConfig, &config); err != nil {
+			return nil, fmt.Errorf("invalid Claude output_config: %w", err)
+		}
+		format = config.Format
+	}
+	if len(format) == 0 {
+		format = legacyFormat
+	}
+	if len(format) == 0 || kitutil.GetJsonType(format) == "null" {
+		return nil, nil
+	}
+	var parsed struct {
+		Type   string          `json:"type"`
+		Name   string          `json:"name"`
+		Schema json.RawMessage `json:"schema"`
+	}
+	if err := kitutil.Unmarshal(format, &parsed); err != nil {
+		return nil, fmt.Errorf("invalid Claude structured output format: %w", err)
+	}
+	if parsed.Type != "json_schema" {
+		return nil, fmt.Errorf("unsupported Claude output format type %q", parsed.Type)
+	}
+	if len(parsed.Schema) == 0 || kitutil.GetJsonType(parsed.Schema) != "object" {
+		return nil, fmt.Errorf("Claude json_schema output format requires an object schema")
+	}
+	formatObject := make(map[string]json.RawMessage)
+	if err := kitutil.Unmarshal(format, &formatObject); err != nil {
+		return nil, fmt.Errorf("invalid Claude structured output format: %w", err)
+	}
+	if strings.TrimSpace(parsed.Name) == "" {
+		name, err := kitutil.Marshal("claude_output")
+		if err != nil {
+			return nil, fmt.Errorf("encode Claude structured output name: %w", err)
+		}
+		formatObject["name"] = name
+	}
+	return kitutil.Marshal(formatObject)
+}
+
+func claudeStructuredOutputChatSchema(format json.RawMessage) (json.RawMessage, error) {
+	var schema map[string]json.RawMessage
+	if err := kitutil.Unmarshal(format, &schema); err != nil {
+		return nil, fmt.Errorf("invalid Claude structured output format: %w", err)
+	}
+	delete(schema, "type")
+	encoded, err := kitutil.Marshal(schema)
+	if err != nil {
+		return nil, fmt.Errorf("encode Claude structured output schema: %w", err)
+	}
+	return encoded, nil
+}
+
 // claudeToolResultToChat maps a structured tool_result content array onto Chat Completions,
 // where a tool message may only carry text. Text blocks stay on the tool message and image
 // blocks come back in Chat shape for the caller to place on the following user message;
 // stringifying them instead would hand base64 image data to the upstream text tokenizer.
 // Arrays holding any other block type keep the historical stringified form so nothing is lost.
-func claudeToolResultToChat(blocks []dto.ClaudeMediaMessage) (string, []dto.MediaContent) {
+func claudeToolResultToChat(blocks []dto.ClaudeMediaMessage) (string, []dto.MediaContent, error) {
 	texts := make([]string, 0, len(blocks))
 	media := make([]dto.MediaContent, 0, len(blocks))
 	for _, block := range blocks {
@@ -303,22 +438,57 @@ func claudeToolResultToChat(blocks []dto.ClaudeMediaMessage) (string, []dto.Medi
 		case block.Type == "image":
 			url := claudeImageSourceURL(block.Source)
 			if url == "" {
-				return requestToJSONString(blocks), nil
+				if block.Source != nil && block.Source.Type == "file" {
+					return "", nil, fmt.Errorf("Claude file-backed tool-result image %q cannot be resolved for Gemini; send the image as base64 or a URL", block.Source.FileID)
+				}
+				return "", nil, fmt.Errorf("Claude tool-result image has unsupported source type %q or no image data", claudeSourceType(block.Source))
 			}
 			media = append(media, dto.MediaContent{Type: "image_url", ImageUrl: &dto.MessageImageUrl{Url: url}})
+		case block.Type == "document":
+			if block.Source != nil && block.Source.Type == "text" {
+				texts = append(texts, kitutil.Interface2String(block.Source.Data))
+				continue
+			}
+			if block.Source != nil && block.Source.Type == "file" {
+				return "", nil, fmt.Errorf("Claude file-backed tool-result document %q cannot be resolved for Gemini; send document content as base64 or text", block.Source.FileID)
+			}
+			if block.Source == nil || block.Source.Type != "base64" || block.Source.MediaType != "application/pdf" {
+				return requestToJSONString(blocks), nil, nil
+			}
+			media = append(media, dto.MediaContent{
+				Type: dto.ContentTypeFile,
+				File: &dto.MessageFile{
+					FileName: "document.pdf",
+					FileData: "data:application/pdf;base64," + kitutil.Interface2String(block.Source.Data),
+				},
+			})
 		default:
-			return requestToJSONString(blocks), nil
+			return requestToJSONString(blocks), nil, nil
 		}
 	}
 	switch {
 	case len(texts) == 0 && len(media) == 0:
-		return requestToJSONString(blocks), nil
+		return requestToJSONString(blocks), nil, nil
 	case len(texts) == 0:
 		// Upstreams reject empty tool content; the images ride on the following user message.
-		return "[image]", media
+		return "[image]", media, nil
 	default:
-		return strings.Join(texts, "\n"), media
+		return strings.Join(texts, "\n"), media, nil
 	}
+}
+
+func claudeSourceType(source *dto.ClaudeMessageSource) string {
+	if source == nil {
+		return ""
+	}
+	return source.Type
+}
+
+func claudeSourceMediaType(source *dto.ClaudeMessageSource) string {
+	if source == nil {
+		return ""
+	}
+	return source.MediaType
 }
 
 // claudeImageSourceURL is the Chat image_url for a Claude image source: a data

@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relaykit/dto"
@@ -159,6 +160,44 @@ func TestVertexResponsesRequestAddsMissingFunctionParameterType(t *testing.T) {
 	assert.Equal(t, "STRING", upstream.Tools[0].FunctionDeclarations[0].Parameters.Properties["projectId"].Type)
 }
 
+func TestVertexResponsesRequestUsesJSONSchemaForAnyOfSiblings(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+
+	request := dto.OpenAIResponsesRequest{
+		Model: "gemini-test",
+		Input: json.RawMessage(`"check pull request status"`),
+		Tools: json.RawMessage(`[{"type":"function","name":"pull_requests_checks","parameters":{"type":"object","properties":{"account":{"anyOf":[{"type":"string"},{"type":"null"}],"description":"Account name"}}}}]`),
+	}
+	got, err := (&Adaptor{RequestMode: RequestModeGemini}).ConvertOpenAIResponsesRequest(ctx, newVertexResponsesRelayInfo(false), request)
+	require.NoError(t, err)
+	geminiRequest, ok := got.(*dto.GeminiChatRequest)
+	require.True(t, ok)
+
+	var upstream struct {
+		Tools []struct {
+			FunctionDeclarations []struct {
+				Parameters struct {
+					Properties map[string]struct {
+						Type        string `json:"type"`
+						Nullable    bool   `json:"nullable"`
+						Description string `json:"description"`
+					} `json:"properties"`
+				} `json:"parameters"`
+			} `json:"functionDeclarations"`
+		} `json:"tools"`
+	}
+	body, err := common.Marshal(geminiRequest)
+	require.NoError(t, err)
+	require.NoError(t, common.Unmarshal(body, &upstream))
+	require.Len(t, upstream.Tools, 1)
+	require.Len(t, upstream.Tools[0].FunctionDeclarations, 1)
+	assert.Equal(t, "STRING", upstream.Tools[0].FunctionDeclarations[0].Parameters.Properties["account"].Type)
+	assert.True(t, upstream.Tools[0].FunctionDeclarations[0].Parameters.Properties["account"].Nullable)
+	assert.Equal(t, "Account name", upstream.Tools[0].FunctionDeclarations[0].Parameters.Properties["account"].Description)
+}
+
 func newVertexResponsesRelayInfo(isStream bool) *relaycommon.RelayInfo {
 	return &relaycommon.RelayInfo{
 		IsStream:        isStream,
@@ -168,6 +207,7 @@ func newVertexResponsesRelayInfo(isStream bool) *relaycommon.RelayInfo {
 		DisablePing:     true,
 		OriginModelName: "gemini-test",
 		ChannelMeta: &relaycommon.ChannelMeta{
+			ChannelType:       constant.ChannelTypeVertexAi,
 			UpstreamModelName: "gemini-test",
 		},
 	}

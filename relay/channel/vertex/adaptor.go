@@ -99,7 +99,21 @@ func (a *Adaptor) ConvertClaudeRequest(c *gin.Context, info *relaycommon.RelayIn
 		// its Anthropic request to Gemini's generateContent schema; the URL and
 		// response handler are selected from the upstream model in Init.
 		geminiAdaptor := gemini.Adaptor{}
-		return geminiAdaptor.ConvertClaudeRequest(c, info, request)
+		converted, err := geminiAdaptor.ConvertClaudeRequest(c, info, request)
+		if err != nil {
+			return nil, err
+		}
+		geminiRequest, ok := converted.(*dto.GeminiChatRequest)
+		if !ok {
+			return nil, fmt.Errorf("expected Gemini generateContent request, got %T", converted)
+		}
+		if model_setting.GetGeminiSettings().RemoveFunctionResponseIdEnabled {
+			removeFunctionCallIDs(geminiRequest)
+		}
+		if c != nil {
+			c.Set("request_model", request.Model)
+		}
+		return geminiRequest, nil
 	}
 	if a.RequestMode != RequestModeClaude {
 		return nil, errors.New("Claude Messages requests are only supported for Gemini and Claude models on Vertex AI")
