@@ -151,6 +151,7 @@ func GeminiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, r
 	}
 	hostedBridge := relayconvert.NewGeminiHostedStreamBridge()
 	var streamErr *types.NewAPIError
+	terminalEventSent := false
 
 	sendEvent := func(event relayconvert.ChatToResponsesStreamEvent) bool {
 		data, err := common.Marshal(event.Payload)
@@ -163,6 +164,10 @@ func GeminiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, r
 				info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonClientGone, err)
 			}
 			return false
+		}
+		switch event.Type {
+		case "response.completed", "response.incomplete", "response.failed":
+			terminalEventSent = true
 		}
 		return true
 	}
@@ -183,6 +188,16 @@ func GeminiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, r
 		}
 		return true
 	}
+	defer func() {
+		if terminalEventSent || info.StreamStatus != nil && info.StreamStatus.EndReason == relaycommon.StreamEndReasonClientGone {
+			return
+		}
+		message := "Gemini Responses stream ended before a terminal event"
+		if streamErr != nil {
+			message = streamErr.Error()
+		}
+		failResponsesStream(errors.New(message))
+	}()
 	sendChunk := func(chunk *dto.GeminiChatResponse) bool {
 		results, err := service.ConvertStreamResponseChunk(c, info, state, chunk)
 		if err != nil {
