@@ -94,6 +94,16 @@ func removeFunctionCallIDs(request *dto.GeminiChatRequest) {
 }
 
 func (a *Adaptor) ConvertClaudeRequest(c *gin.Context, info *relaycommon.RelayInfo, request *dto.ClaudeRequest) (any, error) {
+	if a.RequestMode == RequestModeGemini {
+		// Claude Code can target Gemini models through the Messages API. Convert
+		// its Anthropic request to Gemini's generateContent schema; the URL and
+		// response handler are selected from the upstream model in Init.
+		geminiAdaptor := gemini.Adaptor{}
+		return geminiAdaptor.ConvertClaudeRequest(c, info, request)
+	}
+	if a.RequestMode != RequestModeClaude {
+		return nil, errors.New("Claude Messages requests are only supported for Gemini and Claude models on Vertex AI")
+	}
 	claudeAdaptor := claude.Adaptor{}
 	if _, err := claudeAdaptor.ConvertClaudeRequest(c, info, request); err != nil {
 		return nil, err
