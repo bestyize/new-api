@@ -452,6 +452,13 @@ func (r ResponsesOutput) MarshalJSON() ([]byte, error) {
 			responsesOutputAlias
 			Summary []ResponsesReasoningSummaryPart `json:"summary"`
 		}{responsesOutputAlias(r), []ResponsesReasoningSummaryPart{}})
+	case ResponsesOutputTypeImageGenerationCall:
+		return kitutil.Marshal(struct {
+			Type   string `json:"type"`
+			ID     string `json:"id"`
+			Status string `json:"status,omitempty"`
+			Result string `json:"result,omitempty"`
+		}{Type: r.Type, ID: r.ID, Status: r.Status, Result: r.Result})
 	default:
 		type responsesOutputAlias ResponsesOutput
 		return kitutil.Marshal(responsesOutputAlias(r))
@@ -594,11 +601,13 @@ type ResponsesStreamResponse struct {
 	// - response.function_call_arguments.done
 	// - response.custom_tool_call_input.delta
 	// - response.custom_tool_call_input.done
-	OutputIndex  *int                           `json:"output_index,omitempty"`
-	ContentIndex *int                           `json:"content_index,omitempty"`
-	SummaryIndex *int                           `json:"summary_index,omitempty"`
-	ItemID       string                         `json:"item_id,omitempty"`
-	Part         *ResponsesReasoningSummaryPart `json:"part,omitempty"`
+	OutputIndex       *int                           `json:"output_index,omitempty"`
+	ContentIndex      *int                           `json:"content_index,omitempty"`
+	SummaryIndex      *int                           `json:"summary_index,omitempty"`
+	ItemID            string                         `json:"item_id,omitempty"`
+	Part              *ResponsesReasoningSummaryPart `json:"part,omitempty"`
+	PartialImageIndex *int                           `json:"partial_image_index,omitempty"`
+	PartialImageB64   string                         `json:"partial_image_b64,omitempty"`
 }
 
 // GetOpenAIError 从动态错误类型中提取OpenAIError结构

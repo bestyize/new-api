@@ -2,6 +2,7 @@ package claudemessages
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 
 	"github.com/QuantumNous/new-api/relaykit/dto"
@@ -148,4 +149,45 @@ func TestClaudeMessagesRequestToOpenAIChatKeepsParallelToolResultsContiguous(t *
 	assert.Equal(t, dto.ContentTypeImageURL, parts[0].Type)
 	require.NotNil(t, parts[0].GetImageMedia())
 	assert.Equal(t, dataURL, parts[0].GetImageMedia().Url)
+}
+
+func TestClaudeStructuredOutputAndLegacyMaxTokensMapToOpenAIRequests(t *testing.T) {
+	request := dto.ClaudeRequest{
+		Model:             "claude-test",
+		MaxTokensToSample: lo.ToPtr(uint(23)),
+		OutputConfig:      json.RawMessage(`{"format":{"type":"json_schema","name":"result","schema":{"type":"object","properties":{"ok":{"type":"boolean"}}}}}`),
+	}
+
+	chat, err := ClaudeMessagesRequestToOpenAIChat(context.Background(), request, &convmeta.Values{})
+	require.NoError(t, err)
+	require.NotNil(t, chat.MaxTokens)
+	assert.Equal(t, uint(23), *chat.MaxTokens)
+	require.NotNil(t, chat.ResponseFormat)
+	assert.Equal(t, "json_schema", chat.ResponseFormat.Type)
+	assert.JSONEq(t, `{"name":"result","schema":{"type":"object","properties":{"ok":{"type":"boolean"}}}}`, string(chat.ResponseFormat.JsonSchema))
+
+	responses, err := ClaudeMessagesRequestToOpenAIResponses(context.Background(), request, &convmeta.Values{})
+	require.NoError(t, err)
+	require.NotNil(t, responses.MaxOutputTokens)
+	assert.Equal(t, uint(23), *responses.MaxOutputTokens)
+	assert.JSONEq(t, `{"format":{"type":"json_schema","name":"result","schema":{"type":"object","properties":{"ok":{"type":"boolean"}}}}}`, string(responses.Text))
+}
+
+func TestClaudeMessagesRejectsUnresolvedFileBackedImages(t *testing.T) {
+	request := dto.ClaudeRequest{
+		Model: "claude-test",
+		Messages: []dto.ClaudeMessage{{
+			Role: "user",
+			Content: []dto.ClaudeMediaMessage{{
+				Type:   "image",
+				Source: &dto.ClaudeMessageSource{Type: "file", FileID: "file_123"},
+			}},
+		}},
+	}
+
+	_, err := ClaudeMessagesRequestToOpenAIChat(context.Background(), request, &convmeta.Values{})
+	require.ErrorContains(t, err, "file-backed image \"file_123\"")
+
+	_, err = ClaudeMessagesRequestToOpenAIResponses(context.Background(), request, &convmeta.Values{})
+	require.ErrorContains(t, err, "file-backed image \"file_123\"")
 }

@@ -688,25 +688,24 @@ func attachGeminiRequest(request any, set Set, options *convmeta.Options) (any, 
 			if definition.Function == nil {
 				continue
 			}
-			parametersField, parameters := "parameters", definition.Function.Parameters
+			parameters := definition.Function.Parameters
 			if parameters != nil {
 				cloned, err := kitutil.Any2Type[any](parameters)
 				if err != nil {
 					return nil, diagnostics, fmt.Errorf("tools[%d].parameters: %w", index, err)
 				}
-				var misfits []string
-				parametersField, parameters, misfits = sharedgemini.FunctionParameters(cloned, jsonSchema)
-				if len(misfits) > 0 {
-					diagnostics = append(diagnostics, presentationLoss(fmt.Sprintf("tools[%d].parameters", index), "gemini_schema_keyword_dropped",
-						fmt.Sprintf("Gemini function parameters cannot carry %s", strings.Join(misfits, ", "))))
-				}
+				parameters = cloned
 			}
-			function := map[string]any{
-				"name":          definition.Function.Name,
-				"description":   definition.Function.Description,
-				parametersField: parameters,
+			function, misfits := sharedgemini.FunctionDeclaration(
+				definition.Function.Name,
+				definition.Function.Description,
+				parameters,
+				jsonSchema,
+			)
+			if len(misfits) > 0 {
+				diagnostics = append(diagnostics, presentationLoss(fmt.Sprintf("tools[%d].parameters", index), "gemini_schema_keyword_dropped",
+					fmt.Sprintf("Gemini function parameters cannot carry %s", strings.Join(misfits, ", "))))
 			}
-			deleteEmptyStrings(function)
 			functions = append(functions, function)
 			if definition.Function.Strict != nil {
 				diagnostics = append(diagnostics, presentationLoss(fmt.Sprintf("tools[%d].strict", index), "unsupported_function_strict", "Gemini does not expose OpenAI function strictness"))
@@ -756,11 +755,12 @@ func attachGeminiRequest(request any, set Set, options *convmeta.Options) (any, 
 			}
 			if tool, handled := customTools[index]; handled {
 				if tool != nil {
-					functions = append(functions, map[string]any{
-						"name":        tool.name,
-						"description": tool.description,
-						"parameters":  sharedgemini.CleanFunctionParameters(tool.inputSchema()),
-					})
+					function, misfits := sharedgemini.FunctionDeclaration(tool.name, tool.description, tool.inputSchema(), jsonSchema)
+					if len(misfits) > 0 {
+						diagnostics = append(diagnostics, presentationLoss(fmt.Sprintf("tools[%d].parameters", index), "gemini_schema_keyword_dropped",
+							fmt.Sprintf("Gemini function parameters cannot carry %s", strings.Join(misfits, ", "))))
+					}
+					functions = append(functions, function)
 				}
 				continue
 			}

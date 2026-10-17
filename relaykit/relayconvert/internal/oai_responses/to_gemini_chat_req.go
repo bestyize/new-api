@@ -85,18 +85,29 @@ func OpenAIResponsesRequestToGeminiChat(c context.Context, req *dto.OpenAIRespon
 	if err != nil {
 		return nil, err
 	}
+	functionDeclarations := make([]map[string]any, 0, len(functions))
+	jsonSchema := opts.Gemini.SupportsJSONSchemaModel(upstreamModelName)
 	for i := range functions {
-		if params, ok := functions[i].Parameters.(map[string]any); ok {
-			if props, hasProps := params["properties"].(map[string]any); hasProps && len(props) == 0 {
-				functions[i].Parameters = nil
-				continue
-			}
+		declaration, misfits := sharedgemini.FunctionDeclaration(
+			functions[i].Name,
+			functions[i].Description,
+			functions[i].Parameters,
+			jsonSchema,
+		)
+		for _, misfit := range misfits {
+			convdiag.Add(c, types.ConversionDiagnostic{
+				Code:     "gemini_schema_keyword_dropped",
+				Path:     fmt.Sprintf("tools[%d].parameters", i),
+				Message:  fmt.Sprintf("Gemini function parameters cannot carry %s", misfit),
+				Severity: types.ConversionDiagnosticWarning,
+				To:       types.RelayFormatGemini,
+			})
 		}
-		functions[i].Parameters = sharedgemini.CleanFunctionParameters(functions[i].Parameters)
+		functionDeclarations = append(functionDeclarations, declaration)
 	}
-	if len(functions) > 0 {
+	if len(functionDeclarations) > 0 {
 		geminiRequest.SetTools([]dto.GeminiChatTool{
-			{FunctionDeclarations: functions},
+			{FunctionDeclarations: functionDeclarations},
 		})
 	}
 
@@ -234,6 +245,9 @@ func responsesContentPartToGeminiParts(c context.Context, part map[string]any) (
 	case "input_image", "input_file", "input_audio", "input_video":
 		source := ContentPartToFileSource(part)
 		if source == nil {
+			if partType == "input_image" {
+				return nil, fmt.Errorf("input_image requires image_url; file_id references are not supported by Gemini conversion")
+			}
 			return nil, nil
 		}
 		base64Data, mimeType, err := relaymedia.ResolveBase64Data(c, source, "formatting Responses input for Gemini")

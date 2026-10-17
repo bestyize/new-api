@@ -12,6 +12,7 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/relayconvert/internal/convdiag"
 	kitutil "github.com/QuantumNous/new-api/relaykit/relayconvert/kitutil"
 	"github.com/QuantumNous/new-api/relaykit/relayconvert/reasoning"
+	"github.com/QuantumNous/new-api/relaykit/types"
 )
 
 func ClaudeMessagesRequestToOpenAIResponses(ctx context.Context, claudeRequest dto.ClaudeRequest, info convmeta.Meta) (*dto.OpenAIResponsesRequest, error) {
@@ -19,7 +20,7 @@ func ClaudeMessagesRequestToOpenAIResponses(ctx context.Context, claudeRequest d
 		return nil, errors.New("model is required")
 	}
 
-	input, err := claudeMessagesToResponsesInput(claudeRequest.Messages)
+	input, err := claudeMessagesToResponsesInput(ctx, claudeRequest.Messages)
 	if err != nil {
 		return nil, err
 	}
@@ -51,6 +52,17 @@ func ClaudeMessagesRequestToOpenAIResponses(ctx context.Context, claudeRequest d
 		ToolChoice:        toolChoice,
 		ParallelToolCalls: parallelToolCalls,
 		TopP:              claudeRequest.TopP,
+	}
+	outputFormat, err := claudeStructuredOutputFormat(claudeRequest.OutputConfig, claudeRequest.OutputFormat)
+	if err != nil {
+		return nil, err
+	}
+	if len(outputFormat) > 0 {
+		textConfig, err := kitutil.Marshal(map[string]json.RawMessage{"format": outputFormat})
+		if err != nil {
+			return nil, fmt.Errorf("encode Claude structured output format: %w", err)
+		}
+		responsesRequest.Text = textConfig
 	}
 	if info != nil && !convmeta.OptionsOf(info).OpenRouterDialect {
 		// Keep the outgoing -thinking suffix so a cascaded downstream new-api
@@ -128,7 +140,7 @@ func claudeSystemToResponsesInstructions(request *dto.ClaudeRequest) (json.RawMe
 	return kitutil.Marshal(instructions.String())
 }
 
-func claudeMessagesToResponsesInput(messages []dto.ClaudeMessage) (json.RawMessage, error) {
+func claudeMessagesToResponsesInput(ctx context.Context, messages []dto.ClaudeMessage) (json.RawMessage, error) {
 	input := make([]map[string]any, 0, len(messages))
 	for messageIndex := range messages {
 		message := messages[messageIndex]
@@ -173,19 +185,27 @@ func claudeMessagesToResponsesInput(messages []dto.ClaudeMessage) (json.RawMessa
 					"text": block.GetText(),
 				})
 			case "image":
-				if source := claudeSourceURL(block.Source); source != "" {
-					contentParts = append(contentParts, map[string]any{
-						"type":      "input_image",
-						"image_url": source,
-					})
+				if block.Source != nil && block.Source.Type == "file" {
+					return nil, fmt.Errorf("Claude file-backed image %q cannot be resolved for Responses; send the image as base64 or a URL", block.Source.FileID)
 				}
+				source := claudeSourceURL(block.Source)
+				if source == "" {
+					return nil, fmt.Errorf("Claude image at messages[%d].content[%d] has no usable source", messageIndex, blockIndex)
+				}
+				contentParts = append(contentParts, map[string]any{"type": "input_image", "image_url": source})
 			case "document":
-				if source := claudeSourceURL(block.Source); source != "" {
-					contentParts = append(contentParts, map[string]any{
-						"type":      "input_file",
-						"file_data": source,
-					})
+				if block.Source != nil && block.Source.Type == "file" {
+					return nil, fmt.Errorf("Claude file-backed document %q cannot be resolved for Responses; send document content as base64 or text", block.Source.FileID)
 				}
+				if block.Source != nil && block.Source.Type == "text" {
+					contentParts = append(contentParts, map[string]any{"type": "input_text", "text": kitutil.Interface2String(block.Source.Data)})
+					continue
+				}
+				source := claudeSourceURL(block.Source)
+				if source == "" {
+					return nil, fmt.Errorf("Claude document at messages[%d].content[%d] has no usable source", messageIndex, blockIndex)
+				}
+				contentParts = append(contentParts, map[string]any{"type": "input_file", "file_data": source})
 			case "tool_use":
 				flushContent()
 				arguments, err := kitutil.Marshal(block.Input)
@@ -212,6 +232,16 @@ func claudeMessagesToResponsesInput(messages []dto.ClaudeMessage) (json.RawMessa
 					"call_id": block.ToolUseId,
 					"output":  output,
 				})
+			case "thinking", "redacted_thinking":
+				convdiag.Add(ctx, types.ConversionDiagnostic{
+					Code:     "unsupported_thinking_history",
+					Path:     fmt.Sprintf("messages[%d].content[%d]", messageIndex, blockIndex),
+					Message:  "Claude thinking history is provider-specific and was omitted from Responses request history",
+					Severity: types.ConversionDiagnosticWarning,
+					To:       types.RelayFormatOpenAIResponses,
+				})
+			default:
+				return nil, fmt.Errorf("unsupported Claude message block type %q at messages[%d].content[%d]", block.Type, messageIndex, blockIndex)
 			}
 		}
 		flushContent()
@@ -261,6 +291,9 @@ func claudeToolChoiceToResponses(value any) (json.RawMessage, json.RawMessage, e
 	case "none":
 		converted = "none"
 	case "tool":
+		if strings.TrimSpace(choice.Name) == "" {
+			return nil, nil, errors.New("Claude tool_choice.type=tool requires a tool name")
+		}
 		converted = map[string]any{"type": "function", "name": choice.Name}
 	default:
 		return nil, nil, fmt.Errorf("unsupported Claude tool_choice type %q", choice.Type)
@@ -297,13 +330,29 @@ func claudeToolResultToResponsesOutput(content any) (any, error) {
 		case "text", "input_text":
 			parts = append(parts, map[string]any{"type": "input_text", "text": block.GetText()})
 		case "image":
-			if source := claudeSourceURL(block.Source); source != "" {
-				parts = append(parts, map[string]any{"type": "input_image", "image_url": source})
+			if block.Source != nil && block.Source.Type == "file" {
+				return nil, fmt.Errorf("Claude file-backed tool-result image %q cannot be resolved for Responses; send the image as base64 or a URL", block.Source.FileID)
 			}
+			source := claudeSourceURL(block.Source)
+			if source == "" {
+				return nil, fmt.Errorf("Claude tool-result image has no usable source")
+			}
+			parts = append(parts, map[string]any{"type": "input_image", "image_url": source})
 		case "document":
-			if source := claudeSourceURL(block.Source); source != "" {
-				parts = append(parts, map[string]any{"type": "input_file", "file_data": source})
+			if block.Source != nil && block.Source.Type == "file" {
+				return nil, fmt.Errorf("Claude file-backed tool-result document %q cannot be resolved for Responses; send document content as base64 or text", block.Source.FileID)
 			}
+			if block.Source != nil && block.Source.Type == "text" {
+				parts = append(parts, map[string]any{"type": "input_text", "text": kitutil.Interface2String(block.Source.Data)})
+				continue
+			}
+			source := claudeSourceURL(block.Source)
+			if source == "" {
+				return nil, fmt.Errorf("Claude tool-result document has no usable source")
+			}
+			parts = append(parts, map[string]any{"type": "input_file", "file_data": source})
+		default:
+			return nil, fmt.Errorf("unsupported Claude tool-result block type %q", block.Type)
 		}
 	}
 	if len(parts) == 0 {

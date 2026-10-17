@@ -131,6 +131,7 @@ type ClaudeMessageSource struct {
 	MediaType string `json:"media_type,omitempty"`
 	Data      any    `json:"data,omitempty"`
 	Url       string `json:"url,omitempty"`
+	FileID    string `json:"file_id,omitempty"`
 }
 
 type ClaudeMessage struct {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -63,7 +64,7 @@ func cleanGeminiFunctionParametersWithDepth(params interface{}, depth int) inter
 			}
 		}
 
-		normalizeGeminiSchemaTypeAndNullable(cleanedMap)
+		normalizeGeminiSchemaTypeAndNullable(cleanedMap, depth)
 		sanitizeGeminiEnum(cleanedMap)
 
 		if props, ok := cleanedMap["properties"].(map[string]interface{}); ok && props != nil {
@@ -110,7 +111,7 @@ func cleanGeminiFunctionParametersShallow(params interface{}) interface{} {
 				cleanedMap[key] = val
 			}
 		}
-		normalizeGeminiSchemaTypeAndNullable(cleanedMap)
+		normalizeGeminiSchemaTypeAndNullable(cleanedMap, geminiFunctionSchemaMaxDepth)
 		sanitizeGeminiEnum(cleanedMap)
 		delete(cleanedMap, "properties")
 		delete(cleanedMap, "items")
@@ -147,9 +148,66 @@ func sanitizeGeminiEnum(schema map[string]interface{}) {
 	}
 }
 
-func normalizeGeminiSchemaTypeAndNullable(schema map[string]interface{}) {
+func normalizeGeminiSchemaTypeAndNullable(schema map[string]interface{}, depth int) {
+	if rawAnyOf, hasAnyOf := schema["anyOf"]; hasAnyOf {
+		if variants, ok := rawAnyOf.([]interface{}); ok {
+			if typeName, nullable, compact := compactNullableAnyOf(variants); compact {
+				delete(schema, "anyOf")
+				schema["type"] = typeName
+				if nullable {
+					schema["nullable"] = true
+				}
+			} else {
+				// Gemini's typed Schema requires anyOf to be the only member at
+				// its level. Keep the union itself and let the caller report any
+				// sibling constraints that could not be represented.
+				for key := range schema {
+					if key != "anyOf" {
+						delete(schema, key)
+					}
+				}
+				return
+			}
+		} else {
+			for key := range schema {
+				if key != "anyOf" {
+					delete(schema, key)
+				}
+			}
+			return
+		}
+	}
+
 	rawType, ok := schema["type"]
 	if !ok || rawType == nil {
+		if _, hasProperties := schema["properties"]; hasProperties {
+			schema["type"] = "OBJECT"
+			return
+		}
+		if _, hasItems := schema["items"]; hasItems {
+			schema["type"] = "ARRAY"
+			return
+		}
+		if enum, ok := schema["enum"].([]interface{}); ok && len(enum) > 0 {
+			schema["type"] = geminiSchemaTypeOfValue(enum[0])
+			return
+		}
+		if example, exists := schema["default"]; exists {
+			schema["type"] = geminiSchemaTypeOfValue(example)
+			return
+		}
+		if example, exists := schema["example"]; exists {
+			schema["type"] = geminiSchemaTypeOfValue(example)
+			return
+		}
+		if depth == 0 {
+			schema["type"] = "OBJECT"
+		} else {
+			// Vertex's typed function Schema requires a concrete type. For a
+			// leaf property with no usable type hint, STRING is the least
+			// surprising fallback for common tool arguments such as IDs.
+			schema["type"] = "STRING"
+		}
 		return
 	}
 
@@ -209,15 +267,93 @@ func normalizeGeminiSchemaTypeAndNullable(schema map[string]interface{}) {
 	}
 }
 
+// compactNullableAnyOf converts the common JSON Schema union
+// `anyOf: [{type: T}, {type: null}]` into Gemini's typed `type: T, nullable:
+// true` representation. More complex unions remain as an anyOf-only schema.
+func compactNullableAnyOf(variants []interface{}) (typeName string, nullable bool, ok bool) {
+	if len(variants) == 0 {
+		return "", false, false
+	}
+	for _, variant := range variants {
+		object, valid := variant.(map[string]interface{})
+		if !valid || len(object) != 1 {
+			return "", false, false
+		}
+		value, valid := object["type"].(string)
+		if !valid {
+			return "", false, false
+		}
+		switch strings.ToLower(strings.TrimSpace(value)) {
+		case "null":
+			if nullable {
+				return "", false, false
+			}
+			nullable = true
+		default:
+			normalized, isNull := normalizeSchemaType(value)
+			if isNull || normalized == "" || (typeName != "" && typeName != normalized) {
+				return "", false, false
+			}
+			typeName = normalized
+		}
+	}
+	if typeName == "" {
+		return "", false, false
+	}
+	return typeName, nullable, true
+}
+
+func normalizeSchemaType(value string) (string, bool) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "object":
+		return "OBJECT", false
+	case "array":
+		return "ARRAY", false
+	case "string":
+		return "STRING", false
+	case "integer":
+		return "INTEGER", false
+	case "number":
+		return "NUMBER", false
+	case "boolean":
+		return "BOOLEAN", false
+	case "null":
+		return "", true
+	default:
+		return "", false
+	}
+}
+
+func geminiSchemaTypeOfValue(value interface{}) string {
+	switch value.(type) {
+	case nil:
+		return "STRING"
+	case string:
+		return "STRING"
+	case bool:
+		return "BOOLEAN"
+	case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64:
+		return "INTEGER"
+	case float32, float64:
+		return "NUMBER"
+	case []interface{}:
+		return "ARRAY"
+	case map[string]interface{}:
+		return "OBJECT"
+	default:
+		return "STRING"
+	}
+}
+
 // FunctionParameters returns the Gemini function declaration field that
 // carries schema, and its value. A schema that fits Gemini's typed Schema is
-// cleaned as before, and still left out when its properties are empty. Any
-// other schema goes unchanged to parametersJsonSchema when jsonSchema is
-// true; otherwise it is cleaned anyway and misfits names what the typed
-// Schema cannot carry.
+// cleaned as before, and still left out when its properties are empty. AnyOf
+// siblings are normalized before either the typed or JSON Schema path so they
+// cannot produce a malformed Gemini Schema object.
 func FunctionParameters(schema any, jsonSchema bool) (field string, value any, misfits []string) {
-	misfits = schemaMisfits(schema)
-	object, _ := schema.(map[string]any)
+	normalizedSchema, _, normalizationLosses := normalizeGeminiJSONSchemaAnyOfSiblings(schema)
+	misfits = append(schemaMisfits(normalizedSchema), normalizationLosses...)
+	object, _ := normalizedSchema.(map[string]any)
 	properties, hasProperties := object["properties"].(map[string]any)
 	emptyObject := hasProperties && len(properties) == 0
 	if emptyObject {
@@ -237,12 +373,194 @@ func FunctionParameters(schema any, jsonSchema bool) (field string, value any, m
 		}
 	}
 	if len(misfits) > 0 && jsonSchema {
-		return "parametersJsonSchema", schema, nil
+		return "parametersJsonSchema", normalizedSchema, normalizationLosses
 	}
 	if emptyObject {
 		return "parameters", nil, misfits
 	}
-	return "parameters", CleanFunctionParameters(schema), misfits
+	return "parameters", CleanFunctionParameters(normalizedSchema), misfits
+}
+
+// normalizeGeminiJSONSchemaAnyOfSiblings makes anyOf the only keyword at its
+// schema level, as required by Gemini's typed Schema. Simple nullable unions
+// are represented as type plus nullable; other union annotations and
+// constraints are moved into each branch when that is unambiguous.
+func normalizeGeminiJSONSchemaAnyOfSiblings(schema any) (normalized any, changed bool, losses []string) {
+	lost := make(map[string]struct{})
+	var normalizeAtDepth func(any, string, int) any
+	normalizeAtDepth = func(value any, parentKey string, depth int) any {
+		switch typed := value.(type) {
+		case map[string]any:
+			if depth >= geminiFunctionSchemaMaxDepth {
+				for key := range typed {
+					if isGeminiJSONSchemaChild(key) {
+						lost[fmt.Sprintf("nesting deeper than %d levels", geminiFunctionSchemaMaxDepth)] = struct{}{}
+						changed = true
+						return map[string]any{"type": "string"}
+					}
+				}
+				return value
+			}
+			result := make(map[string]any, len(typed))
+			for key, item := range typed {
+				result[key] = item
+			}
+
+			if rawAnyOf, hasAnyOf := result["anyOf"]; hasAnyOf {
+				variants, isArray := rawAnyOf.([]any)
+				if isArray {
+					keepAnyOf := true
+					if typeName, nullable, compact := compactNullableAnyOf(variants); compact {
+						if existingType, exists := result["type"]; !exists || strings.EqualFold(kitutil.Interface2String(existingType), strings.ToLower(typeName)) {
+							delete(result, "anyOf")
+							result["type"] = strings.ToLower(typeName)
+							if nullable {
+								result["nullable"] = true
+							}
+							changed = true
+							keepAnyOf = false
+						} else {
+							variants = moveAnyOfSiblingsToVariants(result, variants, lost)
+							changed = true
+						}
+					} else if len(result) > 1 {
+						variants = moveAnyOfSiblingsToVariants(result, variants, lost)
+						changed = true
+					}
+					if keepAnyOf {
+						result["anyOf"] = variants
+					}
+				} else if len(result) > 1 {
+					for key := range result {
+						if key != "anyOf" {
+							lost[key] = struct{}{}
+							delete(result, key)
+						}
+					}
+					changed = true
+				}
+			}
+
+			for key, item := range result {
+				if isGeminiJSONSchemaMapChild(parentKey) {
+					result[key] = normalizeAtDepth(item, "", depth+1)
+				} else if isGeminiJSONSchemaChild(key) {
+					result[key] = normalizeAtDepth(item, key, depth+1)
+				}
+			}
+			return result
+		case []any:
+			if !isGeminiJSONSchemaArrayChild(parentKey) {
+				return value
+			}
+			result := make([]any, len(typed))
+			for index, item := range typed {
+				result[index] = normalizeAtDepth(item, parentKey, depth+1)
+			}
+			return result
+		default:
+			return value
+		}
+	}
+
+	normalized = normalizeAtDepth(schema, "", 0)
+	losses = make([]string, 0, len(lost))
+	for keyword := range lost {
+		losses = append(losses, keyword)
+	}
+	slices.Sort(losses)
+	return normalized, changed, losses
+}
+
+func moveAnyOfSiblingsToVariants(schema map[string]any, variants []any, losses map[string]struct{}) []any {
+	siblings := make(map[string]any, len(schema)-1)
+	for key, value := range schema {
+		if key != "anyOf" {
+			siblings[key] = value
+			delete(schema, key)
+		}
+	}
+	result := make([]any, len(variants))
+	for index, variant := range variants {
+		branch, ok := variant.(map[string]any)
+		if !ok {
+			for key := range siblings {
+				losses[key] = struct{}{}
+			}
+			result[index] = variant
+			continue
+		}
+		copyBranch := make(map[string]any, len(branch)+len(siblings))
+		for key, value := range branch {
+			copyBranch[key] = value
+		}
+		for key, value := range siblings {
+			if existing, exists := copyBranch[key]; exists {
+				if reflect.DeepEqual(existing, value) {
+					continue
+				}
+				if key == "description" {
+					existingText, existingOK := existing.(string)
+					valueText, valueOK := value.(string)
+					if existingOK && valueOK {
+						copyBranch[key] = strings.TrimSpace(valueText + "\n" + existingText)
+						continue
+					}
+				}
+				losses[key] = struct{}{}
+				continue
+			}
+			copyBranch[key] = value
+		}
+		result[index] = copyBranch
+	}
+	return result
+}
+
+func isGeminiJSONSchemaChild(key string) bool {
+	switch key {
+	case "properties", "patternProperties", "items", "additionalProperties", "unevaluatedProperties", "anyOf", "oneOf", "allOf", "not", "contains", "propertyNames", "definitions", "$defs", "dependentSchemas", "if", "then", "else":
+		return true
+	default:
+		return false
+	}
+}
+
+func isGeminiJSONSchemaMapChild(key string) bool {
+	switch key {
+	case "properties", "patternProperties", "definitions", "$defs", "dependentSchemas":
+		return true
+	default:
+		return false
+	}
+}
+
+func isGeminiJSONSchemaArrayChild(key string) bool {
+	switch key {
+	case "items", "anyOf", "oneOf", "allOf":
+		return true
+	default:
+		return false
+	}
+}
+
+// FunctionDeclaration builds the JSON object carried by Gemini's
+// functionDeclarations field. Vertex accepts parametersJsonSchema, while the
+// typed parameters field rejects JSON Schema constructs such as anyOf with
+// sibling keywords.
+func FunctionDeclaration(name, description string, schema any, jsonSchema bool) (map[string]any, []string) {
+	declaration := map[string]any{"name": name}
+	if description != "" {
+		declaration["description"] = description
+	}
+	if schema != nil {
+		field, value, misfits := FunctionParameters(schema, jsonSchema)
+		if value != nil {
+			declaration[field] = value
+		}
+		return declaration, misfits
+	}
+	return declaration, nil
 }
 
 // ApplyResponseSchema sets the structured output schema from the json_schema
@@ -255,23 +573,43 @@ func ApplyResponseSchema(ctx context.Context, config *dto.GeminiChatGenerationCo
 	if err := kitutil.Unmarshal(rawFormat, &format); err != nil {
 		return
 	}
-	misfits := schemaMisfits(format.Schema)
+	normalizedSchema, changed, normalizationLosses := normalizeGeminiJSONSchemaAnyOfSiblings(format.Schema)
+	misfits := schemaMisfits(normalizedSchema)
 	if len(misfits) > 0 && jsonSchema {
-		// The raw member keeps the client's key order.
-		var raw struct {
-			Schema json.RawMessage `json:"schema"`
+		if changed {
+			if encoded, err := kitutil.Marshal(normalizedSchema); err == nil {
+				config.ResponseJsonSchema = encoded
+			}
+		} else {
+			// Preserve the client's schema bytes when no normalization is needed.
+			var raw struct {
+				Schema json.RawMessage `json:"schema"`
+			}
+			if err := kitutil.Unmarshal(rawFormat, &raw); err == nil {
+				config.ResponseJsonSchema = raw.Schema
+			}
 		}
-		if err := kitutil.Unmarshal(rawFormat, &raw); err == nil {
-			config.ResponseJsonSchema = raw.Schema
+		if len(config.ResponseJsonSchema) > 0 {
+			if len(normalizationLosses) > 0 {
+				convdiag.Add(ctx, types.ConversionDiagnostic{
+					Code:     "gemini_schema_keyword_dropped",
+					Path:     path,
+					Message:  fmt.Sprintf("Gemini schema cannot represent %s alongside anyOf", strings.Join(normalizationLosses, ", ")),
+					Severity: types.ConversionDiagnosticWarning,
+				})
+			}
 			return
 		}
 	}
-	config.ResponseSchema = RemoveAdditionalProperties(format.Schema, 0)
-	if len(misfits) > 0 {
+	config.ResponseSchema = RemoveAdditionalProperties(normalizedSchema, 0)
+	if len(misfits) > 0 || len(normalizationLosses) > 0 {
+		dropped := append(misfits, normalizationLosses...)
+		slices.Sort(dropped)
+		dropped = slices.Compact(dropped)
 		convdiag.Add(ctx, types.ConversionDiagnostic{
 			Code:     "gemini_schema_keyword_dropped",
 			Path:     path,
-			Message:  fmt.Sprintf("Gemini response schema cannot carry %s", strings.Join(misfits, ", ")),
+			Message:  fmt.Sprintf("Gemini response schema cannot carry %s", strings.Join(dropped, ", ")),
 			Severity: types.ConversionDiagnosticWarning,
 		})
 	}
@@ -306,6 +644,9 @@ func collectSchemaMisfits(schema any, depth int, found map[string]struct{}) {
 			found["boolean schemas"] = struct{}{}
 		}
 		return
+	}
+	if _, hasAnyOf := value["anyOf"]; hasAnyOf && len(value) > 1 {
+		found["anyOf with sibling keywords"] = struct{}{}
 	}
 	for key, item := range value {
 		if _, allowed := geminiOpenAPISchemaAllowedFields[key]; !allowed {
