@@ -94,6 +94,24 @@ func removeFunctionCallIDs(request *dto.GeminiChatRequest) {
 }
 
 func (a *Adaptor) ConvertClaudeRequest(c *gin.Context, info *relaycommon.RelayInfo, request *dto.ClaudeRequest) (any, error) {
+	if a.RequestMode == RequestModeGemini {
+		geminiAdaptor := gemini.Adaptor{}
+		converted, err := geminiAdaptor.ConvertClaudeRequest(c, info, request)
+		if err != nil {
+			return nil, err
+		}
+		geminiRequest, ok := converted.(*dto.GeminiChatRequest)
+		if !ok {
+			return nil, fmt.Errorf("expected Gemini generateContent request, got %T", converted)
+		}
+		if _, err := a.ConvertGeminiRequest(c, info, geminiRequest); err != nil {
+			return nil, err
+		}
+		if c != nil {
+			c.Set("request_model", request.Model)
+		}
+		return geminiRequest, nil
+	}
 	claudeAdaptor := claude.Adaptor{}
 	if _, err := claudeAdaptor.ConvertClaudeRequest(c, info, request); err != nil {
 		return nil, err
@@ -323,8 +341,25 @@ func (a *Adaptor) ConvertEmbeddingRequest(c *gin.Context, info *relaycommon.Rela
 }
 
 func (a *Adaptor) ConvertOpenAIResponsesRequest(c *gin.Context, info *relaycommon.RelayInfo, request dto.OpenAIResponsesRequest) (any, error) {
-	// TODO implement me
-	return nil, errors.New("not implemented")
+	if a.RequestMode != RequestModeGemini {
+		return nil, fmt.Errorf("OpenAI Responses is only supported for Vertex Gemini models, got request mode %d", a.RequestMode)
+	}
+	geminiAdaptor := gemini.Adaptor{}
+	converted, err := geminiAdaptor.ConvertOpenAIResponsesRequest(c, info, request)
+	if err != nil {
+		return nil, err
+	}
+	geminiRequest, ok := converted.(*dto.GeminiChatRequest)
+	if !ok {
+		return nil, fmt.Errorf("expected Gemini generateContent request, got %T", converted)
+	}
+	if _, err := a.ConvertGeminiRequest(c, info, geminiRequest); err != nil {
+		return nil, err
+	}
+	if c != nil {
+		c.Set("request_model", request.Model)
+	}
+	return geminiRequest, nil
 }
 
 func (a *Adaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, requestBody io.Reader) (any, error) {
@@ -338,6 +373,9 @@ func (a *Adaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycom
 		case RequestModeClaude:
 			return claudeAdaptor.DoResponse(c, resp, info)
 		case RequestModeGemini:
+			if info.RelayMode == constant.RelayModeResponses {
+				return gemini.GeminiResponsesStreamHandler(c, info, resp)
+			}
 			if info.RelayMode == constant.RelayModeGemini {
 				return gemini.GeminiTextGenerationStreamHandler(c, info, resp)
 			} else {
@@ -351,6 +389,9 @@ func (a *Adaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycom
 		case RequestModeClaude:
 			return claudeAdaptor.DoResponse(c, resp, info)
 		case RequestModeGemini:
+			if info.RelayMode == constant.RelayModeResponses {
+				return gemini.GeminiResponsesHandler(c, info, resp)
+			}
 			if info.RelayMode == constant.RelayModeGemini {
 				return gemini.GeminiTextGenerationHandler(c, info, resp)
 			} else {
