@@ -377,6 +377,66 @@ func AddToken(c *gin.Context) {
 	})
 }
 
+type provisionTokenRequest struct {
+	Name string `json:"name"`
+}
+
+// AdminProvisionUserToken lets an administrator create an unlimited-quota API
+// key with no model restriction for a common user. Calling it again with the
+// same name returns the existing key, so a caller that crashed before saving
+// the key can retry without leaving an orphan token.
+func AdminProvisionUserToken(c *gin.Context) {
+	targetId, err := strconv.Atoi(c.Param("id"))
+	var request provisionTokenRequest
+	if err != nil || targetId <= 0 || common.DecodeJson(c.Request.Body, &request) != nil {
+		common.ApiErrorT(c, "Invalid parameters")
+		return
+	}
+	name := strings.TrimSpace(request.Name)
+	if name == "" || len(name) > 50 {
+		common.ApiErrorT(c, "Invalid parameters")
+		return
+	}
+	target, err := model.GetUserById(targetId, false)
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	if target.Role != common.RoleCommonUser {
+		common.ApiErrorT(c, "Tokens can only be provisioned for common users")
+		return
+	}
+	if target.Status != common.UserStatusEnabled {
+		common.ApiErrorT(c, "User is disabled")
+		return
+	}
+	key, err := common.GenerateKey()
+	if err != nil {
+		common.ApiErrorT(c, "Failed to generate token")
+		common.SysLog(common.LogText("failed to generate token key: %s", err.Error()))
+		return
+	}
+	now := common.GetTimestamp()
+	token, created, err := model.FindOrCreateUserToken(target.Id, &model.Token{
+		UserId:         target.Id,
+		Name:           name,
+		Key:            key,
+		Status:         common.TokenStatusEnabled,
+		CreatedTime:    now,
+		AccessedTime:   now,
+		ExpiredTime:    -1,
+		UnlimitedQuota: true,
+	})
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	recordManageAuditFor(c, target.Id, "user.token_provision", map[string]any{
+		"username": target.Username, "id": target.Id, "name": token.Name, "token_id": token.Id, "created": created,
+	})
+	common.ApiSuccess(c, gin.H{"id": token.Id, "name": token.Name, "key": token.GetFullKey(), "created": created})
+}
+
 func DeleteToken(c *gin.Context) {
 	id, _ := strconv.Atoi(c.Param("id"))
 	userId := c.GetInt("id")
