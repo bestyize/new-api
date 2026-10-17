@@ -790,6 +790,71 @@ func TestConvertRequestResponsesToGeminiUsesDirectConverter(t *testing.T) {
 	assert.Empty(t, geminiReq.Contents[1].Parts[0].ThoughtSignature)
 }
 
+func TestConvertRequestResponsesToGeminiTypesEveryToolSchemaNode(t *testing.T) {
+	info := &convmeta.Values{
+		ConversionChain:     []types.RelayFormat{types.RelayFormatOpenAIResponses},
+		ChannelMetaAttached: true,
+		UpstreamModelName:   "gemini-test",
+	}
+	stringOrInteger := []any{map[string]any{"type": "string"}, map[string]any{"type": "integer"}}
+	req := &dto.OpenAIResponsesRequest{
+		Model: "gemini-test",
+		Input: mustRawMessage(t, "hi"),
+		Tools: mustRawMessage(t, []map[string]any{{
+			"type": "function",
+			"name": "move_thread_to_project",
+			"parameters": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"optional":    map[string]any{"anyOf": []any{map[string]any{"type": "string"}, map[string]any{"type": "null"}}},
+					"either":      map[string]any{"anyOf": stringOrInteger},
+					"choice":      map[string]any{"oneOf": stringOrInteger},
+					"ref":         map[string]any{"$ref": "#/$defs/Id"},
+					"mode":        map[string]any{"const": "fast"},
+					"note":        map[string]any{"description": "free text"},
+					"anything":    map[string]any{},
+					"nullOnly":    map[string]any{"type": "null"},
+					"url":         map[string]any{"type": "string", "format": "uri"},
+					"when":        map[string]any{"type": "string", "format": "date-time"},
+					"count":       map[string]any{"type": "integer", "format": "int64"},
+					"ratio":       map[string]any{"type": "number", "format": "uint"},
+					"nestedItems": map[string]any{"type": "array", "items": map[string]any{"anyOf": []any{map[string]any{"type": "integer"}, map[string]any{"type": "null"}}}},
+				},
+			},
+		}}),
+	}
+
+	result, err := ConvertRequest(nil, info, types.RelayFormatGemini, req)
+
+	require.NoError(t, err)
+	geminiReq, ok := result.Value.(*dto.GeminiChatRequest)
+	require.True(t, ok)
+	tools := geminiReq.GetTools()
+	require.Len(t, tools, 1)
+	functions, err := kitutil.Any2Type[[]dto.FunctionRequest](tools[0].FunctionDeclarations)
+	require.NoError(t, err)
+	require.Len(t, functions, 1)
+	params, ok := functions[0].Parameters.(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, "OBJECT", params["type"])
+	typedEither := []any{map[string]any{"type": "STRING"}, map[string]any{"type": "INTEGER"}}
+	assert.Equal(t, map[string]any{
+		"optional":    map[string]any{"type": "STRING", "nullable": true},
+		"either":      map[string]any{"anyOf": typedEither},
+		"choice":      map[string]any{"anyOf": typedEither},
+		"ref":         map[string]any{"type": "STRING"},
+		"mode":        map[string]any{"type": "STRING", "enum": []any{"fast"}},
+		"note":        map[string]any{"type": "STRING", "description": "free text"},
+		"anything":    map[string]any{"type": "STRING"},
+		"nullOnly":    map[string]any{"type": "STRING", "nullable": true},
+		"url":         map[string]any{"type": "STRING"},
+		"when":        map[string]any{"type": "STRING", "format": "date-time"},
+		"count":       map[string]any{"type": "INTEGER", "format": "int64"},
+		"ratio":       map[string]any{"type": "NUMBER"},
+		"nestedItems": map[string]any{"type": "ARRAY", "items": map[string]any{"type": "INTEGER", "nullable": true}},
+	}, params["properties"])
+}
+
 func TestConvertRequestResponsesToGeminiSkipsThoughtSignatureWhenDisabled(t *testing.T) {
 	info := &convmeta.Values{
 		Options:             &convmeta.Options{Gemini: convmeta.GeminiOptions{FunctionCallThoughtSignatureEnabled: false}},

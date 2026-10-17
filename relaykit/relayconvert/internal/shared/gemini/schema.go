@@ -62,6 +62,12 @@ func cleanGeminiFunctionParametersWithDepth(params interface{}, depth int) inter
 				cleanedMap[key] = val
 			}
 		}
+		// Gemini has no oneOf; anyOf is the closest, slightly looser, match.
+		if oneOf, ok := v["oneOf"].([]interface{}); ok {
+			if _, hasAnyOf := cleanedMap["anyOf"]; !hasAnyOf {
+				cleanedMap["anyOf"] = oneOf
+			}
+		}
 
 		normalizeGeminiSchemaTypeAndNullable(cleanedMap)
 		sanitizeGeminiEnum(cleanedMap)
@@ -82,12 +88,39 @@ func cleanGeminiFunctionParametersWithDepth(params interface{}, depth int) inter
 		}
 
 		if nested, ok := cleanedMap["anyOf"].([]interface{}); ok && nested != nil {
-			cleanedNested := make([]interface{}, len(nested))
-			for i, item := range nested {
-				cleanedNested[i] = cleanGeminiFunctionParametersWithDepth(item, depth+1)
+			cleanedNested := make([]interface{}, 0, len(nested))
+			for _, item := range nested {
+				// A null-only branch would be left without a type, which Vertex
+				// rejects. Fold it into nullable on the parent instead.
+				if isNullOnlySchema(item) {
+					cleanedMap["nullable"] = true
+					continue
+				}
+				cleanedNested = append(cleanedNested, cleanGeminiFunctionParametersWithDepth(item, depth+1))
 			}
-			cleanedMap["anyOf"] = cleanedNested
+			switch len(cleanedNested) {
+			case 0:
+				delete(cleanedMap, "anyOf")
+			case 1:
+				delete(cleanedMap, "anyOf")
+				if branch, ok := cleanedNested[0].(map[string]interface{}); ok {
+					for key, val := range branch {
+						if _, exists := cleanedMap[key]; !exists {
+							cleanedMap[key] = val
+						}
+					}
+				}
+			default:
+				cleanedMap["anyOf"] = cleanedNested
+			}
 		}
+
+		fallbackType := "STRING"
+		if depth == 0 {
+			fallbackType = "OBJECT"
+		}
+		ensureGeminiSchemaType(v, cleanedMap, fallbackType)
+		sanitizeGeminiFormat(cleanedMap)
 
 		return cleanedMap
 	case []interface{}:
@@ -115,11 +148,82 @@ func cleanGeminiFunctionParametersShallow(params interface{}) interface{} {
 		delete(cleanedMap, "properties")
 		delete(cleanedMap, "items")
 		delete(cleanedMap, "anyOf")
+		ensureGeminiSchemaType(v, cleanedMap, "STRING")
+		sanitizeGeminiFormat(cleanedMap)
 		return cleanedMap
 	case []interface{}:
 		return []interface{}{}
 	default:
 		return params
+	}
+}
+
+// geminiSchemaFormats lists the formats Gemini accepts for each type. Any other
+// format, such as "uri" or "uuid" that agent tools put on string fields, makes
+// the whole request fail with a 400, so it is dropped and the type is kept.
+var geminiSchemaFormats = map[string][]string{
+	"STRING":  {"enum", "date-time"},
+	"NUMBER":  {"float", "double"},
+	"INTEGER": {"int32", "int64"},
+}
+
+func sanitizeGeminiFormat(schema map[string]interface{}) {
+	raw, exists := schema["format"]
+	if !exists {
+		return
+	}
+	format, _ := raw.(string)
+	schemaType, _ := schema["type"].(string)
+	if !slices.Contains(geminiSchemaFormats[schemaType], format) {
+		delete(schema, "format")
+	}
+}
+
+func isNullOnlySchema(schema interface{}) bool {
+	branch, ok := schema.(map[string]interface{})
+	if !ok {
+		return false
+	}
+	switch branchType := branch["type"].(type) {
+	case string:
+		return strings.EqualFold(strings.TrimSpace(branchType), "null")
+	case []interface{}:
+		return len(branchType) == 1 && branchType[0] == "null"
+	}
+	return false
+}
+
+// ensureGeminiSchemaType gives a cleaned schema node the type Vertex requires
+// on every node. $ref, const, empty and description-only schemas lose their
+// only type hint in cleaning, so the type is inferred from the original node
+// and falls back to fallbackType when nothing says otherwise. A $ref cannot be
+// resolved here, so one that points at a non-string schema is sent as STRING.
+func ensureGeminiSchemaType(original, cleaned map[string]interface{}, fallbackType string) {
+	if _, ok := cleaned["type"]; ok {
+		return
+	}
+	if anyOf, ok := cleaned["anyOf"].([]interface{}); ok && len(anyOf) > 0 {
+		return
+	}
+	switch {
+	case original["properties"] != nil:
+		cleaned["type"] = "OBJECT"
+	case original["items"] != nil:
+		cleaned["type"] = "ARRAY"
+	default:
+		switch constValue := original["const"].(type) {
+		case string:
+			cleaned["type"] = "STRING"
+			if _, hasEnum := cleaned["enum"]; !hasEnum {
+				cleaned["enum"] = []interface{}{constValue}
+			}
+		case bool:
+			cleaned["type"] = "BOOLEAN"
+		case float64:
+			cleaned["type"] = "NUMBER"
+		default:
+			cleaned["type"] = fallbackType
+		}
 	}
 }
 
