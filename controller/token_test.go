@@ -892,3 +892,79 @@ func verifyAPITokenAudit(t *testing.T) {
 		assert.EqualValues(t, 1, count)
 	})
 }
+
+func TestAdminProvisionUserToken(t *testing.T) {
+	db := setupTokenControllerTestDB(t)
+	require.NoError(t, db.AutoMigrate(&model.User{}, &model.AuditLog{}))
+	seedUser := func(username string, role, status int) *model.User {
+		user := &model.User{Username: username, Password: "placeholder", Role: role, Status: status, Group: "default", AuthVersion: 1, AffCode: username}
+		require.NoError(t, db.Create(user).Error)
+		return user
+	}
+	member := seedUser("provision-member", common.RoleCommonUser, common.UserStatusEnabled)
+	disabled := seedUser("provision-disabled", common.RoleCommonUser, common.UserStatusDisabled)
+	staff := seedUser("provision-staff", common.RoleAdminUser, common.UserStatusEnabled)
+
+	type provisioned struct {
+		Id      int    `json:"id"`
+		Key     string `json:"key"`
+		Created bool   `json:"created"`
+	}
+	provision := func(userID int, body any) tokenAPIResponse {
+		ctx, recorder := newAuthenticatedContext(t, http.MethodPost, "/api/user/"+strconv.Itoa(userID)+"/token", body, 1)
+		ctx.Set("role", common.RoleRootUser)
+		ctx.Params = gin.Params{{Key: "id", Value: strconv.Itoa(userID)}}
+		AdminProvisionUserToken(ctx)
+		return decodeAPIResponse(t, recorder)
+	}
+	decode := func(response tokenAPIResponse) provisioned {
+		require.True(t, response.Success, response.Message)
+		var data provisioned
+		require.NoError(t, common.Unmarshal(response.Data, &data))
+		return data
+	}
+
+	first := decode(provision(member.Id, gin.H{"name": "wallpaper"}))
+	assert.True(t, first.Created)
+	assert.Len(t, first.Key, 48)
+	var stored model.Token
+	require.NoError(t, db.First(&stored, first.Id).Error)
+	assert.Equal(t, member.Id, stored.UserId)
+	assert.True(t, stored.UnlimitedQuota)
+	assert.False(t, stored.ModelLimitsEnabled)
+	assert.EqualValues(t, -1, stored.ExpiredTime)
+	assert.Equal(t, common.TokenStatusEnabled, stored.Status)
+
+	repeat := decode(provision(member.Id, gin.H{"name": " wallpaper "}))
+	assert.False(t, repeat.Created)
+	assert.Equal(t, first.Id, repeat.Id)
+	assert.Equal(t, first.Key, repeat.Key)
+
+	other := decode(provision(member.Id, gin.H{"name": "forum"}))
+	assert.True(t, other.Created)
+	assert.NotEqual(t, first.Id, other.Id)
+
+	for name, response := range map[string]tokenAPIResponse{
+		"administrator target": provision(staff.Id, gin.H{"name": "wallpaper"}),
+		"disabled target":      provision(disabled.Id, gin.H{"name": "wallpaper"}),
+		"unknown target":       provision(99999, gin.H{"name": "wallpaper"}),
+		"blank name":           provision(member.Id, gin.H{"name": "  "}),
+		"overlong name":        provision(member.Id, gin.H{"name": strings.Repeat("n", 51)}),
+		"missing body":         provision(member.Id, nil),
+	} {
+		assert.False(t, response.Success, name)
+	}
+	var count int64
+	require.NoError(t, db.Model(&model.Token{}).Where("user_id IN ?", []int{staff.Id, disabled.Id}).Count(&count).Error)
+	assert.Zero(t, count)
+	require.NoError(t, db.Model(&model.Token{}).Where("user_id = ?", member.Id).Count(&count).Error)
+	assert.EqualValues(t, 2, count)
+
+	var logs []model.AuditLog
+	require.NoError(t, db.Where("action = ?", "user.token_provision").Find(&logs).Error)
+	require.Len(t, logs, 3)
+	serialized, err := common.Marshal(logs)
+	require.NoError(t, err)
+	assert.NotContains(t, string(serialized), first.Key)
+	assert.NotContains(t, string(serialized), other.Key)
+}

@@ -306,6 +306,33 @@ func (token *Token) Insert() error {
 	return err
 }
 
+// FindOrCreateUserToken returns the user's live token named template.Name, or
+// inserts template when there is none. Concurrent calls for one user are
+// serialized by a row lock on the user, so a name never gets two tokens.
+func FindOrCreateUserToken(userId int, template *Token) (token *Token, created bool, err error) {
+	err = DB.Transaction(func(tx *gorm.DB) error {
+		var owner User
+		if err := lockForUpdate(tx).Select("id").First(&owner, userId).Error; err != nil {
+			return err
+		}
+		var existing Token
+		err := tx.Where("user_id = ? AND name = ?", userId, template.Name).Order("id asc").First(&existing).Error
+		if err == nil {
+			token = &existing
+			return nil
+		}
+		if !errors.Is(err, gorm.ErrRecordNotFound) {
+			return err
+		}
+		if err := tx.Create(template).Error; err != nil {
+			return err
+		}
+		token, created = template, true
+		return nil
+	})
+	return token, created, err
+}
+
 // Update Make sure your token's fields is completed, because this will update non-zero values
 func (token *Token) Update() (err error) {
 	// 写库前失效缓存并设置 fence，防止并发读者把过期快照重新写回缓存。
