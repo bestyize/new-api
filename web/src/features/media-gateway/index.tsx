@@ -16,7 +16,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { useQuery } from '@tanstack/react-query'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { useMemo, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
@@ -25,6 +25,9 @@ import { ConfirmDialog } from '@/components/confirm-dialog'
 import { ErrorState } from '@/components/error-state'
 import { SectionPageLayout } from '@/components/layout'
 import { LoadingState } from '@/components/loading-state'
+import { Button } from '@/components/ui/button'
+import { useCanEditModelPricing } from '@/features/model-pricing/api'
+import { PriceSyncDialog } from '@/features/models/components/dialogs/price-sync-dialog'
 import { handleServerError } from '@/lib/handle-server-error'
 
 import { getEnabledChannels, getModelPricing, getTokenKey, getTokenOptions } from './api'
@@ -62,6 +65,9 @@ export function MediaGateway() {
   const [tokenKeys, setTokenKeys] = useState<Record<number, string>>({})
   const [results, setResults] = useState<Record<string, TestState>>({})
   const [confirming, setConfirming] = useState<PendingTest | null>(null)
+  const [syncingPrices, setSyncingPrices] = useState(false)
+  const canPrice = useCanEditModelPricing()
+  const queryClient = useQueryClient()
 
   const rows = useMemo(
     () => buildRows(channelsQuery.data ?? [], pricingQuery.data ?? []),
@@ -123,6 +129,11 @@ export function MediaGateway() {
       <SectionPageLayout>
         <SectionPageLayout.Title>{t('Media Gateway')}</SectionPageLayout.Title>
         <SectionPageLayout.Actions>
+          {canPrice && (
+            <Button variant='outline' size='sm' onClick={() => setSyncingPrices(true)}>
+              {t('Sync pricing')}
+            </Button>
+          )}
           <TokenPicker tokens={tokensQuery.data ?? []} value={activeToken} disabled={tokensQuery.isLoading} onChange={pickToken} />
         </SectionPageLayout.Actions>
         <SectionPageLayout.Content>
@@ -156,6 +167,14 @@ export function MediaGateway() {
           )}
         </SectionPageLayout.Content>
       </SectionPageLayout>
+      <PriceSyncDialog
+        open={syncingPrices}
+        onOpenChange={(open) => {
+          setSyncingPrices(open)
+          // Prices applied in the dialog replace the ones shown here.
+          if (!open) void queryClient.invalidateQueries({ queryKey: ['media-gateway', 'pricing'] })
+        }}
+      />
       <ConfirmDialog
         open={confirming != null}
         onOpenChange={(open) => {

@@ -149,3 +149,74 @@ func TestPricingSyncCompleteSourcesAndArrayFormats(t *testing.T) {
 	assert.NotContains(t, response.Data.Prices, "sync-invalid-expression")
 	assert.NotContains(t, response.Data.Differences, "sync-already")
 }
+
+func TestPricingSyncLiteLLMPresetConvertsMediaPrices(t *testing.T) {
+	table := `{
+		"sample_spec": {"mode": "chat", "input_cost_per_token": 0.0, "search_context_cost_per_query": {"search_context_size_low": 0.0}},
+		"whisper-1": {"mode": "audio_transcription", "litellm_provider": "openai", "input_cost_per_second": 0.0001, "output_cost_per_second": 0.0001},
+		"gpt-4o-transcribe": {"mode": "audio_transcription", "litellm_provider": "openai", "input_cost_per_token": 2.5e-06, "input_cost_per_audio_token": 2.5e-06, "output_cost_per_token": 1e-05, "input_cost_per_second": 0.0001},
+		"tts-1": {"mode": "audio_speech", "litellm_provider": "openai", "input_cost_per_character": 1.5e-05},
+		"gpt-4o-mini-tts": {"mode": "audio_speech", "litellm_provider": "openai", "input_cost_per_token": 6e-07, "output_cost_per_token": 1e-05, "output_cost_per_audio_token": 1.2e-05, "output_cost_per_second": 0.00025},
+		"gpt-realtime": {"mode": "realtime", "litellm_provider": "openai", "input_cost_per_token": 4e-06, "output_cost_per_token": 1.6e-05, "input_cost_per_audio_token": 3.2e-05, "output_cost_per_audio_token": 6.4e-05},
+		"gpt-image-1": {"mode": "image_generation", "litellm_provider": "openai", "input_cost_per_token": 5e-06, "input_cost_per_image_token": 1e-05, "output_cost_per_image_token": 4e-05},
+		"low/1024-x-1024/gpt-image-1": {"mode": "image_generation", "litellm_provider": "openai", "input_cost_per_image": 0.011},
+		"dall-e-3": {},
+		"aiml/dall-e-3": {"mode": "image_generation", "litellm_provider": "aiml", "output_cost_per_image": 0.052},
+		"azure/hd/1024-x-1024/dall-e-3": {"mode": "image_generation", "litellm_provider": "azure", "input_cost_per_pixel": 8.39233e-08},
+		"azure/standard/1024-x-1024/dall-e-3": {"mode": "image_generation", "litellm_provider": "azure", "input_cost_per_pixel": 4.19617e-08},
+		"rerank-v3.5": {"mode": "rerank", "litellm_provider": "cohere", "input_cost_per_query": 0.002, "input_cost_per_token": 0.0},
+		"sora-2": {"mode": "video_generation", "litellm_provider": "openai", "output_cost_per_video_per_second": 0.1},
+		"broken-price": {"mode": "chat", "input_cost_per_token": "unknown"}
+	}`
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, "/BerriAI/litellm/main/model_prices_and_context_window.json", r.URL.Path)
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		_, _ = w.Write([]byte(table))
+	}))
+	defer server.Close()
+	var response struct {
+		Success bool
+		Data    struct {
+			Prices map[string]struct {
+				Upstreams map[string]map[string]any
+			}
+			TestResults []dto.TestResult `json:"test_results"`
+		}
+	}
+	body := map[string]any{"include_unchanged": true, "upstreams": []map[string]any{
+		{"id": liteLLMPresetID, "name": liteLLMPresetName, "base_url": server.URL, "endpoint": server.URL + "/BerriAI/litellm/main/model_prices_and_context_window.json"},
+	}}
+	recorder := modelManagementRequest(t, FetchUpstreamRatios, http.MethodPost, "/api/ratio_sync/fetch", body, &response)
+	require.True(t, response.Success, recorder.Body.String())
+	require.Len(t, response.Data.TestResults, 1)
+	require.Equal(t, "success", response.Data.TestResults[0].Status, response.Data.TestResults[0].Error)
+
+	source := liteLLMPresetName + "(-102)"
+	cases := []struct {
+		model string
+		want  map[string]any
+	}{
+		// One minute of uploaded audio is billed as 1000 tokens: $0.006/min.
+		{"whisper-1", map[string]any{"billing_mode": "ratio", "model_ratio": 3.0}},
+		{"gpt-4o-transcribe", map[string]any{"billing_mode": "ratio", "model_ratio": 1.25, "completion_ratio": 4.0, "audio_ratio": 1.0}},
+		// Characters are counted as input tokens; the generated audio is free.
+		{"tts-1", map[string]any{"billing_mode": "ratio", "model_ratio": 7.5, "audio_completion_ratio": 0.0}},
+		// $0.015 per minute of speech is 1000 audio tokens at 0.3 × 25.
+		{"gpt-4o-mini-tts", map[string]any{"billing_mode": "ratio", "model_ratio": 0.3, "completion_ratio": 20.0, "audio_ratio": 25.0, "audio_completion_ratio": 1.0}},
+		{"gpt-realtime", map[string]any{"billing_mode": "ratio", "model_ratio": 2.0, "completion_ratio": 4.0, "audio_ratio": 8.0, "audio_completion_ratio": 2.0}},
+		{"gpt-image-1", map[string]any{"billing_mode": "ratio", "model_ratio": 2.5, "completion_ratio": 8.0, "image_ratio": 2.0}},
+		// The first-party 1024x1024 standard price wins over a reseller's.
+		{"dall-e-3", map[string]any{"billing_mode": "ratio", "model_price": 0.044}},
+		{"rerank-v3.5", map[string]any{"billing_mode": "ratio", "model_price": 0.002}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.model, func(t *testing.T) {
+			assert.Equal(t, tc.want, response.Data.Prices[tc.model].Upstreams[source])
+		})
+	}
+	for _, skipped := range []string{"sample_spec", "sora-2", "broken-price", "low/1024-x-1024/gpt-image-1", "aiml/dall-e-3"} {
+		assert.NotContains(t, response.Data.Prices, skipped)
+	}
+	assert.True(t, isLiteLLMPriceEndpoint("https://cdn.jsdelivr.net/gh/BerriAI/litellm@main/model_prices_and_context_window.json"), "a mirror of the table is recognized")
+	assert.False(t, isLiteLLMPriceEndpoint("https://models.dev/api.json"))
+}

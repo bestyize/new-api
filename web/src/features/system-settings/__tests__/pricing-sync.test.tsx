@@ -563,6 +563,72 @@ it('shows a source failure instead of a no-differences result and retries the se
   expect(post.mock.calls[0]).toEqual(post.mock.calls[1])
 })
 
+it('fetches the LiteLLM price table when its preset is selected', async () => {
+  vi.spyOn(api, 'get').mockImplementation(async (url) => {
+    if (url === '/api/ratio_sync/channels') {
+      return {
+        data: {
+          success: true,
+          data: [
+            {
+              id: -102,
+              name: 'LiteLLM 价格预设',
+              base_url: 'https://raw.githubusercontent.com',
+              status: 1,
+            },
+          ],
+        },
+      }
+    }
+    return {
+      data: {
+        success: true,
+        data: {
+          entries: [],
+          empty_version: 'empty',
+          options: pricingOptions({}),
+        },
+      },
+    }
+  })
+  const post = vi.spyOn(api, 'post').mockResolvedValue({
+    data: {
+      success: true,
+      data: {
+        prices: {},
+        differences: {},
+        test_results: [{ name: 'LiteLLM 价格预设(-102)', status: 'success' }],
+      },
+    },
+  })
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  })
+  render(
+    <QueryClientProvider client={client}>
+      <UpstreamRatioSync />
+    </QueryClientProvider>
+  )
+  const user = userEvent.setup()
+  await user.click(screen.getByRole('button', { name: 'Select price sources' }))
+  await user.click(
+    await screen.findByRole('checkbox', {
+      name: 'Select LiteLLM pricing preset',
+    })
+  )
+  await user.click(screen.getByRole('button', { name: 'Confirm Selection' }))
+  await waitFor(() => expect(post).toHaveBeenCalled())
+  expect(post.mock.calls[0][1]).toMatchObject({
+    upstreams: [
+      {
+        id: -102,
+        endpoint:
+          'https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json',
+      },
+    ],
+  })
+})
+
 it('preserves upstream expression text so a repeated comparison remains unchanged', () => {
   const source =
     'tier("base", p * 2 + c * 8) * (header("service-tier") == "fast" ? 2 : 1)'

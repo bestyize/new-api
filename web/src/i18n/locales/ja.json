@@ -3830,6 +3830,7 @@
     "Models updated successfully": "モデルが正常に更新されました",
     "Models used on this site": "このサイトで使用するモデル",
     "models.dev pricing preset": "models.dev 料金プリセット",
+    "LiteLLM pricing preset": "LiteLLM 料金プリセット",
     "Modify existing subscription plan configuration": "既存のサブスクリプションプラン設定を変更",
     "Module availability": "モジュールの可用性",
     "MokaAI": "MokaAI",
