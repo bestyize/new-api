@@ -3534,6 +3534,7 @@
     "List view": "Вид списка",
     "Listing also depends on metadata visibility and the user’s group access.": "Отображение также зависит от настроек видимости метаданных и доступа пользователя к группам.",
     "Listing hidden": "Скрыто",
+    "LiteLLM pricing preset": "Набор цен LiteLLM",
     "Live refresh pauses when no task is running": "Автообновление приостанавливается, когда нет выполняемых задач",
     "LLM Leaderboard": "Рейтинг LLM",
     "LLM prompt helper": "Помощник с промптом для LLM",
