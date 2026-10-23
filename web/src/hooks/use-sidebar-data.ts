@@ -31,6 +31,7 @@ import {
   Radio,
   ServerCog,
   Settings,
+  Shapes,
   ShieldCheck,
   Ticket,
   User,
@@ -141,6 +142,11 @@ export function useSidebarData(): SidebarData {
             title: t('Models'),
             url: '/models/metadata',
             icon: Box,
+          },
+          {
+            title: t('Media Gateway'),
+            url: '/media-gateway',
+            icon: Shapes,
           },
           {
             title: t('Users'),
