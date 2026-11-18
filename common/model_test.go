@@ -36,3 +36,15 @@ func TestDeepSeekToolRoutingNamesReportTheirEndpoint(t *testing.T) {
 	}
 	assert.Equal(t, []constant.EndpointType{constant.EndpointTypeOpenAI}, common.GetEndpointTypesByChannelType(constant.ChannelTypeDeepSeek, "deepseek-flash"))
 }
+
+func TestGeminiEndpointsExposeCrossProtocolRoutes(t *testing.T) {
+	want := []constant.EndpointType{
+		constant.EndpointTypeGemini,
+		constant.EndpointTypeOpenAI,
+		constant.EndpointTypeOpenAIResponse,
+		constant.EndpointTypeAnthropic,
+	}
+
+	assert.Equal(t, want, common.GetEndpointTypesByChannelType(constant.ChannelTypeGemini, "gemini-2.5-flash"))
+	assert.Equal(t, want, common.GetEndpointTypesByChannelType(constant.ChannelTypeVertexAi, "gemini-2.5-flash"))
+}
