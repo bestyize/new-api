@@ -43,6 +43,10 @@ const (
 	modelsDevHost               = "models.dev"
 	modelsDevPath               = "/api.json"
 	modelsDevInputCostRatioBase = 1000.0
+	liteLLMPresetID             = -102
+	liteLLMPresetName           = "LiteLLM 价格预设"
+	liteLLMPresetBaseURL        = "https://raw.githubusercontent.com"
+	liteLLMPriceFile            = "model_prices_and_context_window.json"
 )
 
 func nearlyEqual(a, b float64) bool {
@@ -314,6 +318,7 @@ func FetchUpstreamRatios(c *gin.Context) {
 				fullURL = chItem.BaseURL + endpoint
 			}
 			isModelsDev := isModelsDevAPIEndpoint(fullURL)
+			isLiteLLM := isLiteLLMPriceEndpoint(fullURL)
 
 			uniqueName := chItem.Name
 			if chItem.ID != 0 {
@@ -375,7 +380,7 @@ func FetchUpstreamRatios(c *gin.Context) {
 			}
 
 			// Content-Type 和响应体大小校验
-			if ct := resp.Header.Get("Content-Type"); ct != "" && !strings.Contains(strings.ToLower(ct), "application/json") {
+			if ct := resp.Header.Get("Content-Type"); ct != "" && !isLiteLLM && !strings.Contains(strings.ToLower(ct), "application/json") {
 				logger.LogWarn(c.Request.Context(), common.LogText("unexpected content-type from %s: %s", chItem.Name, ct))
 			}
 			limited := io.LimitReader(resp.Body, maxRatioConfigBytes)
@@ -403,6 +408,18 @@ func FetchUpstreamRatios(c *gin.Context) {
 				converted, err := convertModelsDevToRatioData(bytes.NewReader(bodyBytes))
 				if err != nil {
 					logger.LogWarn(c.Request.Context(), common.LogText("models.dev parse failed from %s: %s", chItem.Name, err.Error()))
+					ch <- upstreamResult{Name: uniqueName, Err: err.Error()}
+					return
+				}
+				ch <- upstreamResult{Name: uniqueName, Data: converted}
+				return
+			}
+
+			// type5: LiteLLM model_prices_and_context_window.json -> convert per-mode pricing to ratios
+			if isLiteLLM {
+				converted, err := convertLiteLLMToRatioData(bytes.NewReader(bodyBytes))
+				if err != nil {
+					logger.LogWarn(c.Request.Context(), common.LogText("LiteLLM parse failed from %s: %s", chItem.Name, err.Error()))
 					ch <- upstreamResult{Name: uniqueName, Err: err.Error()}
 					return
 				}
@@ -1162,6 +1179,13 @@ func GetSyncableChannels(c *gin.Context) {
 		ID:      modelsDevPresetID,
 		Name:    modelsDevPresetName,
 		BaseURL: modelsDevPresetBaseURL,
+		Status:  1,
+	})
+
+	syncableChannels = append(syncableChannels, dto.SyncableChannel{
+		ID:      liteLLMPresetID,
+		Name:    liteLLMPresetName,
+		BaseURL: liteLLMPresetBaseURL,
 		Status:  1,
 	})
 

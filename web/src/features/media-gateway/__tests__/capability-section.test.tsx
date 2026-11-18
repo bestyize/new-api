@@ -23,8 +23,13 @@ import { CapabilitySection } from '../components/capability-section'
 import { CAPABILITIES } from '../lib/capabilities'
 import { testKey, type GatewayRow } from '../lib/rows'
 
-const speech = CAPABILITIES.find((capability) => capability.id === 'speech')!
-const search = CAPABILITIES.find((capability) => capability.id === 'search')!
+function capability(id: string) {
+  const found = CAPABILITIES.find((item) => item.id === id)
+  if (!found) throw new Error(`missing capability ${id}`)
+  return found
+}
+const speech = capability('speech')
+const search = capability('search')
 const rows: GatewayRow[] = [
   { model: 'tts-1', channel: { id: 1, name: 'OpenAI' }, price: { kind: 'ratio', ratio: 7.5 } },
   { model: 'tts-1', channel: { id: 3, name: 'Backup' }, price: null },
