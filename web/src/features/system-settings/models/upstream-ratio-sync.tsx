@@ -60,6 +60,8 @@ import {
 } from './conflict-confirm-dialog'
 import {
   DEFAULT_ENDPOINT,
+  LITELLM_PRESET_ENDPOINT,
+  LITELLM_PRESET_ID,
   MODELS_DEV_PRESET_ENDPOINT,
   MODELS_DEV_PRESET_ID,
   OFFICIAL_CHANNEL_ENDPOINT,
@@ -82,6 +84,7 @@ import { UpstreamRatioSyncTable } from './upstream-ratio-sync-table'
 
 function getDefaultEndpointForChannel(channel: UpstreamChannel): string {
   if (channel.id === MODELS_DEV_PRESET_ID) return MODELS_DEV_PRESET_ENDPOINT
+  if (channel.id === LITELLM_PRESET_ID) return LITELLM_PRESET_ENDPOINT
   if (channel.id === OFFICIAL_CHANNEL_ID) return OFFICIAL_CHANNEL_ENDPOINT
   if (channel.type === OPENROUTER_CHANNEL_TYPE) return OPENROUTER_ENDPOINT
   return DEFAULT_ENDPOINT
