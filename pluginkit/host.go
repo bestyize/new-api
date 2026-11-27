@@ -37,7 +37,7 @@ const MaxPluginKeyLength = 30
 // test derives the set from new-api's routers and checks this list.
 var newAPIReservedKeys = []string{
 	"401", "403", "404", "500", "503", "about", "ali", "api", "assets", "channels", "chat", "chat2link",
-	"console", "dashboard", "errors", "forbidden", "forgot-password", "keys", "login", "mj", "models",
+	"console", "dashboard", "errors", "forbidden", "forgot-password", "keys", "login", "media-gateway", "mj", "models",
 	"oauth", "otp", "pg", "playground", "pricing", "privacy-policy", "profile", "rankings",
 	"redemption-codes", "register", "request-processing", "reset", "security", "setup", "sign-in",
 	"sign-up", "subscriptions", "suno", "system-info", "system-settings", "task-plugins", "usage-logs",
