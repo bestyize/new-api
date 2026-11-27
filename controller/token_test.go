@@ -13,6 +13,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1014,4 +1015,140 @@ func verifyAPITokenAudit(t *testing.T) {
 		require.NoError(t, model.DB.Model(&model.Token{}).Where("name = ?", "audit-down").Count(&count).Error)
 		assert.EqualValues(t, 1, count)
 	})
+}
+
+func TestAdminProvisionUserToken(t *testing.T) {
+	db := setupTokenControllerTestDB(t)
+	require.NoError(t, db.AutoMigrate(&model.User{}, &model.AuditLog{}))
+	seedUser := func(username string, role, status int) *model.User {
+		user := &model.User{Username: username, Password: "placeholder", Role: role, Status: status, Group: "default", AuthVersion: 1, AffCode: username}
+		require.NoError(t, db.Create(user).Error)
+		return user
+	}
+	member := seedUser("provision-member", common.RoleCommonUser, common.UserStatusEnabled)
+	disabled := seedUser("provision-disabled", common.RoleCommonUser, common.UserStatusDisabled)
+	staff := seedUser("provision-staff", common.RoleAdminUser, common.UserStatusEnabled)
+
+	type provisioned struct {
+		Id      int    `json:"id"`
+		Key     string `json:"key"`
+		Created bool   `json:"created"`
+	}
+	provision := func(userID int, body any) tokenAPIResponse {
+		ctx, recorder := newAuthenticatedContext(t, http.MethodPost, "/api/user/"+strconv.Itoa(userID)+"/token", body, 1)
+		ctx.Set("role", common.RoleRootUser)
+		ctx.Params = gin.Params{{Key: "id", Value: strconv.Itoa(userID)}}
+		AdminProvisionUserToken(ctx)
+		return decodeAPIResponse(t, recorder)
+	}
+	decode := func(response tokenAPIResponse) provisioned {
+		require.True(t, response.Success, response.Message)
+		var data provisioned
+		require.NoError(t, common.Unmarshal(response.Data, &data))
+		return data
+	}
+
+	first := decode(provision(member.Id, gin.H{"name": "wallpaper"}))
+	assert.True(t, first.Created)
+	assert.Len(t, first.Key, 48)
+	var stored model.Token
+	require.NoError(t, db.First(&stored, first.Id).Error)
+	assert.Equal(t, member.Id, stored.UserId)
+	assert.True(t, stored.UnlimitedQuota)
+	assert.False(t, stored.ModelLimitsEnabled)
+	assert.EqualValues(t, -1, stored.ExpiredTime)
+	assert.Equal(t, common.TokenStatusEnabled, stored.Status)
+
+	repeat := decode(provision(member.Id, gin.H{"name": " wallpaper "}))
+	assert.False(t, repeat.Created)
+	assert.Equal(t, first.Id, repeat.Id)
+	assert.Equal(t, first.Key, repeat.Key)
+
+	other := decode(provision(member.Id, gin.H{"name": "forum"}))
+	assert.True(t, other.Created)
+	assert.NotEqual(t, first.Id, other.Id)
+
+	for name, response := range map[string]tokenAPIResponse{
+		"administrator target": provision(staff.Id, gin.H{"name": "wallpaper"}),
+		"disabled target":      provision(disabled.Id, gin.H{"name": "wallpaper"}),
+		"unknown target":       provision(99999, gin.H{"name": "wallpaper"}),
+		"blank name":           provision(member.Id, gin.H{"name": "  "}),
+		"overlong name":        provision(member.Id, gin.H{"name": strings.Repeat("n", 51)}),
+		"missing body":         provision(member.Id, nil),
+	} {
+		assert.False(t, response.Success, name)
+	}
+	var count int64
+	require.NoError(t, db.Model(&model.Token{}).Where("user_id IN ?", []int{staff.Id, disabled.Id}).Count(&count).Error)
+	assert.Zero(t, count)
+	require.NoError(t, db.Model(&model.Token{}).Where("user_id = ?", member.Id).Count(&count).Error)
+	assert.EqualValues(t, 2, count)
+
+	var logs []model.AuditLog
+	require.NoError(t, db.Where("action = ?", "user.token_provision").Find(&logs).Error)
+	require.Len(t, logs, 3)
+	serialized, err := common.Marshal(logs)
+	require.NoError(t, err)
+	assert.NotContains(t, string(serialized), first.Key)
+	assert.NotContains(t, string(serialized), other.Key)
+}
+
+func TestFindOrCreateUserTokenSerializesConcurrentCalls(t *testing.T) {
+	db := setupManageUserTestDB(t)
+	if common.UsingMainDatabase(common.DatabaseTypeSQLite) {
+		t.Skip("the user row lock is a no-op on SQLite; run with TEST_MANAGE_USER_DIALECT=postgres or mysql and the matching TEST_*_DSN")
+	}
+	require.NoError(t, db.AutoMigrate(&model.Token{}))
+	// The race window between the existence check and the insert is microseconds wide, so widen it.
+	// Without the user row lock every caller passes the check during this pause and inserts a duplicate.
+	require.NoError(t, db.Callback().Create().Before("gorm:create").Register("test:slow_token_insert", func(tx *gorm.DB) {
+		if tx.Statement != nil && tx.Statement.Table == "tokens" {
+			time.Sleep(50 * time.Millisecond)
+		}
+	}))
+	user := model.User{Username: "provision-race", Password: "placeholder", Role: common.RoleCommonUser, Status: common.UserStatusEnabled, Group: "default", AuthVersion: 1, AffCode: "provision-race"}
+	require.NoError(t, db.Create(&user).Error)
+
+	const callers = 12
+	var (
+		wg      sync.WaitGroup
+		errs    [callers]error
+		keys    [callers]string
+		created [callers]bool
+	)
+	for i := range callers {
+		wg.Go(func() {
+			key, err := common.GenerateKey()
+			if err != nil {
+				errs[i] = err
+				return
+			}
+			token, wasCreated, err := model.FindOrCreateUserToken(user.Id, &model.Token{
+				UserId: user.Id, Name: "server-ai", Key: key, Status: common.TokenStatusEnabled, ExpiredTime: -1, UnlimitedQuota: true,
+			})
+			errs[i], created[i] = err, wasCreated
+			if token != nil {
+				keys[i] = token.Key
+			}
+		})
+	}
+	wg.Wait()
+
+	createdCount := 0
+	for i := range callers {
+		require.NoError(t, errs[i])
+		assert.Equal(t, keys[0], keys[i], "every concurrent caller must receive the same key")
+		if created[i] {
+			createdCount++
+		}
+	}
+	assert.Equal(t, 1, createdCount, "exactly one caller creates the token")
+	var count int64
+	require.NoError(t, db.Model(&model.Token{}).Where("user_id = ? AND name = ?", user.Id, "server-ai").Count(&count).Error)
+	assert.EqualValues(t, 1, count)
+
+	other, otherCreated, err := model.FindOrCreateUserToken(user.Id, &model.Token{UserId: user.Id, Name: "forum", Key: keys[0][:40] + "abcdefgh", Status: common.TokenStatusEnabled, ExpiredTime: -1, UnlimitedQuota: true})
+	require.NoError(t, err)
+	assert.True(t, otherCreated, "a different name is a different token")
+	assert.NotEqual(t, keys[0], other.Key)
 }
